@@ -3705,6 +3705,7 @@ impl PaneRuntime {
     }
 
     fn paste_payload(&self, text: String) -> Bytes {
+        let text = sanitize_paste_text(text);
         let text = crate::platform::prepare_paste_text_for_pty(text);
         let bracketed = self.bracketed_paste_enabled();
         let payload = if bracketed {
@@ -3885,6 +3886,37 @@ impl PaneRuntime {
             None
         }
     }
+}
+
+fn sanitize_paste_text(text: String) -> String {
+    // Match xterm and the vendored libghostty-vt paste encoder. Replacing ESC
+    // also prevents clipboard text from terminating bracketed paste early.
+    let replaced_control = |ch| {
+        matches!(
+            ch,
+            '\0' | '\u{8}'
+                | '\u{5}'
+                | '\u{4}'
+                | '\u{1b}'
+                | '\u{7f}'
+                | '\u{3}'
+                | '\u{1c}'
+                | '\u{15}'
+                | '\u{1a}'
+                | '\u{11}'
+                | '\u{13}'
+                | '\u{17}'
+                | '\u{16}'
+                | '\u{12}'
+                | '\u{f}'
+        )
+    };
+    if !text.chars().any(replaced_control) {
+        return text;
+    }
+    text.chars()
+        .map(|ch| if replaced_control(ch) { ' ' } else { ch })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4228,6 +4260,34 @@ mod tests {
         }
         assert_eq!(runtime.content_seq(), revision);
         runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn plain_paste_neutralizes_terminal_control_bytes() {
+        let pane = PaneRuntime::test_with_screen_bytes(80, 24, b"");
+        let expected = if cfg!(windows) {
+            "a b c [201~d e\r\nf\tg"
+        } else {
+            "a b c [201~d e\nf\tg"
+        };
+        assert_eq!(
+            pane.paste_payload("a\0b\u{3}c\u{1b}[201~d\u{7f}e\nf\tg".into()),
+            Bytes::from(expected)
+        );
+    }
+
+    #[tokio::test]
+    async fn bracketed_paste_neutralizes_terminal_control_bytes() {
+        let pane = PaneRuntime::test_with_screen_bytes(80, 24, b"\x1b[?2004h");
+        let expected = if cfg!(windows) {
+            "\x1b[200~a b c [201~d e\r\nf\tg\x1b[201~"
+        } else {
+            "\x1b[200~a b c [201~d e\nf\tg\x1b[201~"
+        };
+        assert_eq!(
+            pane.paste_payload("a\0b\u{3}c\u{1b}[201~d\u{7f}e\nf\tg".into()),
+            Bytes::from(expected)
+        );
     }
 
     #[tokio::test]

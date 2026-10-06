@@ -296,10 +296,15 @@ fn clamp_to_pane(screen_col: u16, screen_row: u16, pane_inner: Rect) -> (u16, u1
     (clamped_row - pane_inner.y, clamped_col - pane_inner.x)
 }
 
-fn osc52_sequence(bytes: &[u8]) -> String {
+/// Builds an OSC 52 write for a specific selection buffer.
+///
+/// The selection parameter is `c` for the system clipboard and `p` for the
+/// PRIMARY selection. Some terminals still only honor BEL-terminated OSC 52
+/// writes, so herdr emits BEL even though ST works in newer emulators.
+fn osc52_sequence_for(bytes: &[u8], selection: char) -> String {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    format!("\x1b]52;c;{encoded}\x07")
+    format!("\x1b]52;{selection};{encoded}\x07")
 }
 
 fn contains_wsl_marker(value: &str) -> bool {
@@ -352,28 +357,144 @@ fn should_prefer_osc52() -> bool {
     )
 }
 
-/// Write clipboard bytes to the system clipboard via native platform tools or OSC 52.
+/// Which clipboard buffers a copy should be written to.
 ///
-/// OSC 52 format: `ESC ] 52 ; c ; <base64> BEL`
+/// On Linux/X11/Wayland the system clipboard (CLIPBOARD, pasted with Ctrl/Cmd+V)
+/// and the selection clipboard (PRIMARY, pasted with middle-click) are
+/// independent. macOS and Windows have no PRIMARY, so `primary` is a no-op there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardTarget {
+    /// Write to the system clipboard (OSC 52 `c`).
+    pub clipboard: bool,
+    /// Write to the PRIMARY selection clipboard (OSC 52 `p`).
+    pub primary: bool,
+}
+
+impl ClipboardTarget {
+    /// Explicit copies (copy mode yank, OSC 52 from a pane child) always target
+    /// the system clipboard only.
+    pub const SYSTEM: Self = Self {
+        clipboard: true,
+        primary: false,
+    };
+
+    /// Whether automatic copy targets PRIMARY without replacing the system clipboard.
+    pub const fn is_primary_only(self) -> bool {
+        self.primary && !self.clipboard
+    }
+
+    /// Resolves the target for an automatic on-select copy from configuration.
+    ///
+    /// Returns `None` when copy-on-select is disabled or its only target is not
+    /// supported on this platform, signalling the caller to skip the copy.
+    pub fn from_copy_on_select(mode: crate::config::CopyOnSelect) -> Option<Self> {
+        Self::from_copy_on_select_with_primary_support(
+            mode,
+            crate::platform::primary_clipboard_supported(),
+        )
+    }
+
+    fn from_copy_on_select_with_primary_support(
+        mode: crate::config::CopyOnSelect,
+        primary_supported: bool,
+    ) -> Option<Self> {
+        let target = match mode {
+            crate::config::CopyOnSelect::Disabled => return None,
+            crate::config::CopyOnSelect::Clipboard => Self::SYSTEM,
+            crate::config::CopyOnSelect::Primary => Self {
+                clipboard: false,
+                primary: primary_supported,
+            },
+            crate::config::CopyOnSelect::Both => Self {
+                clipboard: true,
+                primary: primary_supported,
+            },
+        };
+        (target.clipboard || target.primary).then_some(target)
+    }
+}
+
+impl Default for ClipboardTarget {
+    fn default() -> Self {
+        Self::SYSTEM
+    }
+}
+
+/// Clipboard buffer a paste reads from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasteSource {
+    /// The selection clipboard (PRIMARY on Linux/X11/Wayland). Platforms
+    /// without one read the system clipboard instead.
+    Primary,
+    /// The system clipboard.
+    Clipboard,
+}
+
+impl PasteSource {
+    /// Resolves the buffer a middle-click paste reads from configuration.
+    ///
+    /// Returns `None` when middle-click paste is disabled.
+    pub fn from_paste_on_middle_click(mode: crate::config::PasteOnMiddleClick) -> Option<Self> {
+        match mode {
+            crate::config::PasteOnMiddleClick::Disabled => None,
+            crate::config::PasteOnMiddleClick::Primary => Some(Self::Primary),
+            crate::config::PasteOnMiddleClick::Clipboard => Some(Self::Clipboard),
+        }
+    }
+}
+
+/// Reads text from `source` on this host.
 ///
-/// Some terminals still only honor BEL-terminated OSC 52 writes, so herdr
-/// emits BEL here even though ST works in newer emulators.
+/// Returns `None` when the buffer is empty or unreachable, so the caller
+/// pastes nothing rather than silently pasting a different buffer.
+pub fn read_clipboard_text(source: PasteSource) -> Option<String> {
+    let text = match source {
+        PasteSource::Primary => crate::platform::read_primary(),
+        PasteSource::Clipboard => crate::platform::read_clipboard_text(),
+    };
+    text.filter(|text| !text.is_empty())
+}
+
+/// Write clipboard bytes to the requested clipboard buffers.
 ///
-/// Returns false when the clipboard already holds the same text or output fails.
-pub fn write_osc52_bytes(bytes: &[u8]) -> bool {
+/// Each requested buffer is written natively where possible. System clipboard
+/// writes fall back to OSC 52 `c`; Linux PRIMARY writes fall back to OSC 52 `p`.
+///
+/// Returns false when no buffer was written because the system clipboard
+/// already holds the same text or output failed.
+pub fn write_clipboard_bytes(bytes: &[u8], target: ClipboardTarget) -> bool {
+    let mut written = false;
+    if target.clipboard {
+        written |= write_one_clipboard(bytes, false);
+    }
+    if target.primary && crate::platform::primary_clipboard_supported() {
+        written |= write_one_clipboard(bytes, true);
+    }
+    written
+}
+
+fn write_one_clipboard(bytes: &[u8], primary: bool) -> bool {
     let prefer_osc52 = should_prefer_osc52();
-    if !prefer_osc52 && crate::platform::clipboard_text_matches(bytes) == Some(true) {
+    if !prefer_osc52 && !primary && crate::platform::clipboard_text_matches(bytes) == Some(true) {
         tracing::debug!(bytes = bytes.len(), "suppressed duplicate clipboard write");
         return false;
     }
 
-    if !prefer_osc52 && crate::platform::write_clipboard(bytes) {
-        true
-    } else {
-        let sequence = osc52_sequence(bytes);
-        let mut stdout = std::io::stdout();
-        stdout.write_all(sequence.as_bytes()).is_ok() && stdout.flush().is_ok()
+    if !prefer_osc52 {
+        let native_ok = if primary {
+            crate::platform::write_primary(bytes)
+        } else {
+            crate::platform::write_clipboard(bytes)
+        };
+        if native_ok {
+            return true;
+        }
     }
+
+    let selection = if primary { 'p' } else { 'c' };
+    let sequence = osc52_sequence_for(bytes, selection);
+    let mut stdout = std::io::stdout();
+    stdout.write_all(sequence.as_bytes()).is_ok() && stdout.flush().is_ok()
 }
 
 #[cfg(test)]
@@ -423,7 +544,73 @@ mod tests {
 
     #[test]
     fn osc52_sequence_uses_bel_terminator() {
-        assert_eq!(osc52_sequence(b"hello"), "\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(osc52_sequence_for(b"hello", 'c'), "\x1b]52;c;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn osc52_sequence_uses_primary_selector() {
+        assert_eq!(osc52_sequence_for(b"hello", 'p'), "\x1b]52;p;aGVsbG8=\x07");
+    }
+
+    #[test]
+    fn paste_source_from_paste_on_middle_click_maps_modes() {
+        use crate::config::PasteOnMiddleClick;
+        assert_eq!(
+            PasteSource::from_paste_on_middle_click(PasteOnMiddleClick::Disabled),
+            None
+        );
+        assert_eq!(
+            PasteSource::from_paste_on_middle_click(PasteOnMiddleClick::Primary),
+            Some(PasteSource::Primary)
+        );
+        assert_eq!(
+            PasteSource::from_paste_on_middle_click(PasteOnMiddleClick::Clipboard),
+            Some(PasteSource::Clipboard)
+        );
+    }
+
+    #[test]
+    fn clipboard_target_from_copy_on_select_maps_modes() {
+        use crate::config::CopyOnSelect;
+        assert_eq!(
+            ClipboardTarget::from_copy_on_select_with_primary_support(CopyOnSelect::Disabled, true,),
+            None
+        );
+        assert_eq!(
+            ClipboardTarget::from_copy_on_select_with_primary_support(
+                CopyOnSelect::Clipboard,
+                true,
+            ),
+            Some(ClipboardTarget::SYSTEM)
+        );
+        assert_eq!(
+            ClipboardTarget::from_copy_on_select_with_primary_support(CopyOnSelect::Primary, true,),
+            Some(ClipboardTarget {
+                clipboard: false,
+                primary: true
+            })
+        );
+        assert_eq!(
+            ClipboardTarget::from_copy_on_select_with_primary_support(CopyOnSelect::Both, true),
+            Some(ClipboardTarget {
+                clipboard: true,
+                primary: true
+            })
+        );
+        assert_eq!(
+            ClipboardTarget::from_copy_on_select_with_primary_support(CopyOnSelect::Primary, false,),
+            None
+        );
+        assert_eq!(
+            ClipboardTarget::from_copy_on_select_with_primary_support(CopyOnSelect::Both, false),
+            Some(ClipboardTarget::SYSTEM)
+        );
+        assert!(!ClipboardTarget::SYSTEM.is_primary_only());
+        assert!(ClipboardTarget {
+            clipboard: false,
+            primary: true,
+        }
+        .is_primary_only());
     }
 
     #[test]

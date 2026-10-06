@@ -262,6 +262,75 @@ fn popup_owns_keys_text_paste_and_mouse_before_shell_controls() {
 }
 
 #[test]
+fn middle_click_pastes_into_popup_without_mouse_reporting() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.paste_on_middle_click = crate::config::PasteOnMiddleClick::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface_with_popup();
+    pane_surface
+        .popup
+        .as_mut()
+        .expect("popup surface")
+        .mouse_reporting = false;
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("popup frame");
+    let popup = state.hits.popup.as_ref().expect("popup hit");
+
+    let outcome =
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: popup.inner_rect.x,
+            row: popup.inner_rect.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+
+    assert!(outcome.requests.is_empty());
+    assert!(matches!(
+        &outcome.actions[..],
+        [ClientShellAction::PasteClipboard {
+            target: ClientInputTarget::Popup(terminal_id),
+            source: crate::selection::PasteSource::Primary,
+        }] if terminal_id == "terminal-popup"
+    ));
+}
+
+#[test]
+fn middle_click_defers_to_popup_apps_that_report_mouse() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.paste_on_middle_click = crate::config::PasteOnMiddleClick::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface_with_popup());
+    state.compose(106, 20).expect("popup frame");
+    let popup = state.hits.popup.as_ref().expect("popup hit");
+
+    let outcome =
+        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: popup.inner_rect.x,
+            row: popup.inner_rect.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+
+    assert!(outcome.actions.is_empty());
+    assert!(matches!(
+        &outcome.requests[..],
+        [ClientMessage::ClientShellPopupInput {
+            terminal_id,
+            events,
+        }] if terminal_id == "terminal-popup"
+            && matches!(
+                &events[..],
+                [ClientPaneInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Middle
+                    ),
+                    ..
+                }]
+            )
+    ));
+}
+
+#[test]
 fn popup_transition_dismisses_client_overlays_and_restores_pane_input_after_close() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));

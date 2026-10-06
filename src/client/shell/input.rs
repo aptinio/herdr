@@ -5,9 +5,35 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 const LOCAL_INPUT_SOURCE: u8 = 0;
 
-fn is_retained_selection_copy_key(key: &crate::input::TerminalKey) -> bool {
+fn is_host_forwarded_clipboard_copy_key(key: &crate::input::TerminalKey) -> bool {
     matches!(key.code, KeyCode::Char('c' | 'C'))
-        && matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+}
+
+fn is_retained_selection_copy_key(key: &crate::input::TerminalKey) -> bool {
+    is_host_forwarded_clipboard_copy_key(key)
+        || (matches!(key.code, KeyCode::Char('c' | 'C'))
+            && matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::SUPER))
+}
+
+fn copy_on_select_retains_selection(copy_on_select: crate::config::CopyOnSelect) -> bool {
+    crate::selection::ClipboardTarget::from_copy_on_select(copy_on_select)
+        .is_none_or(crate::selection::ClipboardTarget::is_primary_only)
+}
+
+fn is_configured_retained_selection_copy_key(
+    copy_on_select: crate::config::CopyOnSelect,
+    key: &crate::input::TerminalKey,
+) -> bool {
+    match copy_on_select {
+        crate::config::CopyOnSelect::Disabled => is_retained_selection_copy_key(key),
+        crate::config::CopyOnSelect::Primary => {
+            is_host_forwarded_clipboard_copy_key(key)
+                || (!crate::platform::primary_clipboard_supported()
+                    && is_retained_selection_copy_key(key))
+        }
+        crate::config::CopyOnSelect::Clipboard | crate::config::CopyOnSelect::Both => false,
+    }
 }
 
 /// True for Ctrl+[, the terminal-level equivalent of Esc.
@@ -149,6 +175,13 @@ impl ClientShellState {
         crate::input::TerminalKey::new(KeyCode::Backspace, alt)
             .with_kind(key.kind)
             .with_vt_bytes(bytes)
+    }
+
+    fn focused_pane_reports_mouse(&self) -> bool {
+        let focused_pane_id = self.focused_pane_id();
+        self.hits.panes.iter().any(|hit| {
+            hit.mouse_reporting && focused_pane_id.as_deref() == Some(hit.pane_id.as_str())
+        })
     }
 
     #[cfg(test)]
@@ -643,16 +676,35 @@ impl ClientShellState {
             return None;
         }
         self.word_selection_gesture = None;
-        if self.mode != ClientShellMode::Copy
+        if self.mode == ClientShellMode::Terminal
             && self.copy_or_terminal_mode() != ClientShellMode::Copy
-            && !self.config.copy_on_select
-            && is_retained_selection_copy_key(key)
+            && is_configured_retained_selection_copy_key(self.config.copy_on_select, key)
             && self
                 .selection
                 .as_ref()
                 .is_some_and(crate::selection::Selection::is_visible)
         {
-            self.request_selection_copy(outcome, true);
+            if is_host_forwarded_clipboard_copy_key(key) {
+                if let Some(binding) =
+                    crate::input::resolve_direct_binding(&self.config.keybinds.keybinds, key)
+                {
+                    self.selection = None;
+                    self.stop_selection_autoscroll();
+                    self.selection_highlight_clear_deadline = None;
+                    outcome.repaint = true;
+                    self.record_binding(binding, outcome);
+                    return None;
+                }
+                if self.config.keybinds.matches_prefix(key) {
+                    self.selection = None;
+                    self.stop_selection_autoscroll();
+                    self.selection_highlight_clear_deadline = None;
+                    self.mode = ClientShellMode::Prefix;
+                    outcome.repaint = true;
+                    return None;
+                }
+            }
+            self.request_selection_copy(outcome, true, crate::selection::ClipboardTarget::SYSTEM);
             self.selection = None;
             self.stop_selection_autoscroll();
             self.selection_highlight_clear_deadline = None;
@@ -679,6 +731,14 @@ impl ClientShellState {
                 if self.config.keybinds.matches_prefix(key) {
                     self.mode = ClientShellMode::Prefix;
                     outcome.repaint = true;
+                    return None;
+                }
+                // Host-forwarded copy must not become an interrupt in a plain shell.
+                // Mouse-reporting apps retain their own explicit-copy shortcut.
+                if copy_on_select_retains_selection(self.config.copy_on_select)
+                    && is_host_forwarded_clipboard_copy_key(key)
+                    && !self.focused_pane_reports_mouse()
+                {
                     return None;
                 }
                 self.focused_pane_id().map(ClientInputTarget::Pane)

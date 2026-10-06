@@ -1939,14 +1939,21 @@ async fn run_client_loop(
                             &mut state,
                             &mut prefix_input_source,
                         );
-                        let (replay_mouse, dispatch_repaint) = dispatch_client_shell_actions(
-                            actions,
-                            &mut endpoint_commands,
-                            &mut write_stream,
-                            state.shell.as_mut(),
-                            &mut state.detached_process_children,
-                            &mut scheduled_activation,
-                        )?;
+                        let (replay_mouse, dispatch_repaint, action_requests) =
+                            dispatch_client_shell_actions(
+                                actions,
+                                &mut endpoint_commands,
+                                &mut write_stream,
+                                state.shell.as_mut(),
+                                &mut state.detached_process_children,
+                                &mut scheduled_activation,
+                            )?;
+                        if write_stream.active_surface_available() && pending_activation.is_none() {
+                            for request in action_requests {
+                                write_to_server(&mut write_stream, &request)
+                                    .map_err(ClientError::ConnectionLost)?;
+                            }
+                        }
                         let repaint = repaint || dispatch_repaint;
                         if replay_mouse.is_empty() {
                             if repaint {
@@ -1988,7 +1995,10 @@ async fn run_client_loop(
                             let (width, height) = state.reported_size;
                             let frame = state.shell.as_mut().and_then(|shell| {
                                 shell
-                                    .show_copy_feedback(std::time::Instant::now())
+                                    .show_copy_feedback(
+                                        std::time::Instant::now(),
+                                        crate::selection::ClipboardTarget::SYSTEM,
+                                    )
                                     .then(|| shell.compose(width, height))
                                     .flatten()
                             });

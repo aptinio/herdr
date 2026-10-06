@@ -260,9 +260,29 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # mouse_capture = true
 
 # Automatically copy text selected with the mouse.
-# Set false to retain drag or double-click word selection until Ctrl+C,
-# or Cmd+C when the host forwards it, copies and clears it.
+# false       = retain drag or double-click word selection until Ctrl+C, a host-forwarded
+#               Ctrl+Shift+C, or a host-forwarded Cmd+C copies and clears it ("disabled" is an alias).
+# true        = copy to the system clipboard ("clipboard" is an alias).
+# "primary"   = copy to the selection clipboard only (PRIMARY, middle-click paste on Linux)
+#               and retain the selection. A host-forwarded Ctrl+Shift+C copies it to the
+#               system clipboard.
+# "both"      = copy to both the system clipboard and the selection clipboard.
+# macOS/Windows have no selection clipboard: "both" behaves like true and "primary" selects without
+# automatic copying while retaining the existing Ctrl+C and host-forwarded Cmd+C explicit copy shortcuts.
+# In ordinary terminal routing, a configured Herdr direct binding or prefix takes precedence over
+# host-forwarded Ctrl+Shift+C. With copy-on-select disabled or set to "primary", that key is
+# forwarded to a focused pane app that reports mouse input when no retained Herdr selection exists;
+# otherwise it is consumed.
 # copy_on_select = true
+
+# Paste on middle-click inside a pane.
+# Herdr captures the mouse, so the host terminal never performs its own middle-click paste while Herdr runs.
+# false       = middle-click never pastes ("disabled" is an alias).
+# true        = paste the selection clipboard ("primary" is an alias; PRIMARY on Linux).
+# "clipboard" = paste the system clipboard.
+# macOS/Windows have no selection clipboard, so "primary" reads the system clipboard there.
+# Pane apps that request mouse reporting keep receiving the middle-click instead of pasting.
+# paste_on_middle_click = false
 
 # Host cursor policy: "auto", "native", or "drawn".
 # "auto" draws Herdr's own cursor on native Windows builds and WSL to avoid ConPTY cursor flicker, and uses the native terminal cursor elsewhere.

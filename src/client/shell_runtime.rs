@@ -4,12 +4,33 @@ pub(super) fn dispatch_client_shell_actions(
     actions: Vec<shell::ClientShellAction>,
     endpoint_commands: &mut endpoint_commands::EndpointCommands,
     endpoints: &mut endpoint::EndpointRegistry,
+    shell: Option<&mut shell::ClientShellState>,
+    detached_process_children: &mut Vec<std::process::Child>,
+    scheduled_activation: &mut Option<ClientLoopEvent>,
+) -> Result<(Vec<crossterm::event::MouseEvent>, bool, Vec<ClientMessage>), ClientError> {
+    dispatch_client_shell_actions_with_clipboard_reader(
+        actions,
+        endpoint_commands,
+        endpoints,
+        shell,
+        detached_process_children,
+        scheduled_activation,
+        crate::selection::read_clipboard_text,
+    )
+}
+
+fn dispatch_client_shell_actions_with_clipboard_reader(
+    actions: Vec<shell::ClientShellAction>,
+    endpoint_commands: &mut endpoint_commands::EndpointCommands,
+    endpoints: &mut endpoint::EndpointRegistry,
     mut shell: Option<&mut shell::ClientShellState>,
     detached_process_children: &mut Vec<std::process::Child>,
     scheduled_activation: &mut Option<ClientLoopEvent>,
-) -> Result<(Vec<crossterm::event::MouseEvent>, bool), ClientError> {
+    mut read_clipboard_text: impl FnMut(crate::selection::PasteSource) -> Option<String>,
+) -> Result<(Vec<crossterm::event::MouseEvent>, bool, Vec<ClientMessage>), ClientError> {
     let mut replay_mouse = Vec::new();
     let mut repaint = false;
+    let mut requests = Vec::new();
     for action in actions {
         match action {
             shell::ClientShellAction::Endpoint {
@@ -33,8 +54,18 @@ pub(super) fn dispatch_client_shell_actions(
                     repaint |= shell.cancel_endpoint_request(&request.id);
                 }
             }
-            shell::ClientShellAction::ClipboardWrite(bytes) => {
-                crate::selection::write_osc52_bytes(&bytes);
+            shell::ClientShellAction::ClipboardWrite { bytes, target } => {
+                crate::selection::write_clipboard_bytes(&bytes, target);
+            }
+            shell::ClientShellAction::PasteClipboard { target, source } => {
+                // The clipboard is read here, on the host that owns the mouse,
+                // so a remote client pastes its own selection buffer.
+                if let Some(text) = read_clipboard_text(source) {
+                    requests.push(shell::target_event_message(
+                        target,
+                        protocol::ClientPaneInputEvent::Paste(text),
+                    ));
+                }
             }
             shell::ClientShellAction::ActivateEndpoint {
                 endpoint_id,
@@ -76,7 +107,7 @@ pub(super) fn dispatch_client_shell_actions(
             }
         }
     }
-    Ok((replay_mouse, repaint))
+    Ok((replay_mouse, repaint, requests))
 }
 
 pub(super) fn client_shell_resize_message(
@@ -283,7 +314,7 @@ pub(super) fn begin_endpoint_activation(
     if already_active {
         if let (Some(shell), Some(target)) = (state.shell.as_mut(), target) {
             let actions = shell.focus_endpoint_target(target);
-            let (_, repaint) = dispatch_client_shell_actions(
+            let (_, repaint, requests) = dispatch_client_shell_actions(
                 actions,
                 endpoint_commands,
                 endpoints,
@@ -291,6 +322,7 @@ pub(super) fn begin_endpoint_activation(
                 &mut state.detached_process_children,
                 scheduled_activation,
             )?;
+            debug_assert!(requests.is_empty());
             if repaint {
                 if let Some(frame) = shell.compose(state.reported_size.0, state.reported_size.1) {
                     state.present_frame(frame);
@@ -734,7 +766,7 @@ pub(super) fn finish_client_shell_input(
         query_host_terminal_theme();
     }
     sync_client_shell_keyboard_report_all(state)?;
-    let (replay, dispatch_repaint) = dispatch_client_shell_actions(
+    let (replay, dispatch_repaint, action_requests) = dispatch_client_shell_actions(
         outcome.actions,
         endpoint_commands,
         endpoints,
@@ -759,7 +791,7 @@ pub(super) fn finish_client_shell_input(
         .as_ref()
         .is_none_or(|shell| shell.endpoint_is_online(endpoints.active_id()))
         && endpoints.active_surface_available();
-    for request in outcome.requests {
+    for request in outcome.requests.into_iter().chain(action_requests) {
         if let ClientMessage::ClientShellHostTheme { update } = &request {
             state.record_host_theme_update(update);
             if let Some(activation) = pending_activation.as_mut() {
@@ -822,6 +854,51 @@ pub(super) fn finish_client_shell_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_paste_dispatch_does_not_bypass_the_input_guards() {
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<ClientMessage>>>);
+        impl endpoint::EndpointTransport for Capture {
+            fn send(&mut self, message: &ClientMessage) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok(())
+            }
+        }
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut endpoints = endpoint::EndpointRegistry::new(
+            Capture(sent.clone()),
+            1,
+            endpoint::EndpointNegotiation::default(),
+        );
+        let mut commands = endpoint_commands::EndpointCommands::default();
+        let (replay, repaint, requests) = dispatch_client_shell_actions_with_clipboard_reader(
+            vec![shell::ClientShellAction::PasteClipboard {
+                target: shell::ClientInputTarget::Pane("pane_1".into()),
+                source: crate::selection::PasteSource::Primary,
+            }],
+            &mut commands,
+            &mut endpoints,
+            None,
+            &mut Vec::new(),
+            &mut None,
+            |source| {
+                assert_eq!(source, crate::selection::PasteSource::Primary);
+                Some("clipboard text".into())
+            },
+        )
+        .unwrap();
+        assert!(replay.is_empty());
+        assert!(!repaint);
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(matches!(
+            &requests[..],
+            [ClientMessage::ClientShellPaneInput { pane_id, events }]
+                if pane_id == "pane_1" && matches!(
+                    &events[..],
+                    [protocol::ClientPaneInputEvent::Paste(text)] if text == "clipboard text"
+                )
+        ));
+    }
 
     #[test]
     fn host_color_reaches_server_before_first_snapshot() {

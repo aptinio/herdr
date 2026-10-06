@@ -916,6 +916,20 @@ impl ClientShellState {
         if let Some(hit) = self.hits.popup.clone() {
             if super::contains(hit.inner_rect, point) {
                 match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Middle) if !hit.mouse_reporting => {
+                        if let Some(source) =
+                            crate::selection::PasteSource::from_paste_on_middle_click(
+                                self.config.paste_on_middle_click,
+                            )
+                        {
+                            outcome.actions.push(ClientShellAction::PasteClipboard {
+                                target: ClientInputTarget::Popup(hit.pane_id),
+                                source,
+                            });
+                        } else {
+                            self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
+                        }
+                    }
                     MouseEventKind::Down(button) => {
                         self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
                         if hit.mouse_reporting {
@@ -1761,9 +1775,18 @@ impl ClientShellState {
                 .selection
                 .as_mut()
                 .is_some_and(crate::selection::Selection::finish);
-            if copied && self.config.copy_on_select {
-                self.request_selection_copy(outcome, true);
-                self.selection = None;
+            let copy_target = copied
+                .then(|| {
+                    crate::selection::ClipboardTarget::from_copy_on_select(
+                        self.config.copy_on_select,
+                    )
+                })
+                .flatten();
+            if let Some(target) = copy_target {
+                self.request_selection_copy(outcome, true, target);
+                if !target.is_primary_only() {
+                    self.selection = None;
+                }
             } else if self
                 .selection
                 .as_ref()
@@ -2279,21 +2302,45 @@ impl ClientShellState {
                 }
             }
             MouseEventKind::Down(MouseButton::Middle) => {
-                if let Some(hit) = self
+                let pane_hit = self
                     .hits
                     .panes
                     .iter()
-                    .find(|hit| super::contains(hit.inner_rect, point) && hit.mouse_reporting)
-                    .cloned()
-                {
-                    self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
-                    self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
-                        last_position: self.pane_mouse_position(&hit, mouse),
-                        hit,
-                        button: MouseButton::Middle,
-                        stripped_modifiers: crossterm::event::KeyModifiers::empty(),
-                        last_event: mouse,
-                    });
+                    .find(|hit| super::contains(hit.inner_rect, point))
+                    .cloned();
+                if let Some(hit) = pane_hit {
+                    if hit.mouse_reporting {
+                        // The pane app asked for mouse reporting, so the click
+                        // belongs to it; pasting would swallow an event it
+                        // requested. Host terminals apply the same precedence.
+                        self.push_pane_mouse_event(&hit, mouse, mouse.modifiers, outcome);
+                        self.pane_mouse_gesture = Some(ClientPaneMouseGesture {
+                            last_position: self.pane_mouse_position(&hit, mouse),
+                            hit,
+                            button: MouseButton::Middle,
+                            stripped_modifiers: crossterm::event::KeyModifiers::empty(),
+                            last_event: mouse,
+                        });
+                    } else if self.copy_or_terminal_mode() != ClientShellMode::Copy {
+                        if let Some(source) =
+                            crate::selection::PasteSource::from_paste_on_middle_click(
+                                self.config.paste_on_middle_click,
+                            )
+                        {
+                            self.push_endpoint_method(
+                                crate::api::schema::Method::PaneFocus(
+                                    crate::api::schema::PaneTarget {
+                                        pane_id: hit.pane_id.clone(),
+                                    },
+                                ),
+                                outcome,
+                            );
+                            let target = ClientInputTarget::Pane(hit.pane_id);
+                            outcome
+                                .actions
+                                .push(ClientShellAction::PasteClipboard { target, source });
+                        }
+                    }
                 }
             }
             MouseEventKind::Up(MouseButton::Left | MouseButton::Middle)

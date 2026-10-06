@@ -251,6 +251,21 @@ pub fn write_clipboard(_bytes: &[u8]) -> bool {
 }
 
 /// Unsupported platform stub.
+pub const fn primary_clipboard_supported() -> bool {
+    false
+}
+
+/// Unsupported platform stub.
+pub fn write_primary(_bytes: &[u8]) -> bool {
+    false
+}
+
+/// Unsupported platform stub.
+pub fn read_primary() -> Option<String> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn read_clipboard_text() -> Option<String> {
     None
 }

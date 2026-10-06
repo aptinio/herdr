@@ -409,7 +409,7 @@ fn client_double_click_selects_word_and_copies_only_after_release() {
             );
             let copied = word_row_reply(&mut state, &word_read_id(&actions), "bravo");
             assert!(
-                matches!(&copied[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"bravo")
+                matches!(&copied[..], [ClientShellAction::ClipboardWrite { bytes, target: crate::selection::ClipboardTarget::SYSTEM }] if bytes == b"bravo")
             );
             assert!(state.tick_copy_feedback(state.selection_highlight_clear_deadline.unwrap()));
             assert!(state.selection.is_none());
@@ -424,9 +424,91 @@ fn client_double_click_selects_word_and_copies_only_after_release() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_double_click_selection_does_not_expire() {
+    assert_primary_double_click_retention(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_double_click_selection_does_not_expire_when_release_precedes_rows() {
+    assert_primary_double_click_retention(true);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_primary_double_click_retention(release_before_response: bool) {
+    let mut state = word_drag_state(true);
+    state.config.copy_on_select = crate::config::CopyOnSelect::Primary;
+    let initial = start_word_drag(&mut state);
+    let release = MouseEventKind::Up(MouseButton::Left);
+    if release_before_response {
+        word_drag_mouse(&mut state, release, 0, 8);
+    }
+    let mut actions = word_row_reply(&mut state, &initial, "alpha bravo charlie");
+    if !release_before_response {
+        assert!(actions.is_empty());
+        actions = word_drag_mouse(&mut state, release, 0, 8).actions;
+    }
+    assert!(state.selection_highlight_clear_deadline.is_none());
+    let copied = word_row_reply(&mut state, &word_read_id(&actions), "bravo");
+    assert!(
+        matches!(&copied[..], [ClientShellAction::ClipboardWrite { bytes, target }]
+            if bytes == b"bravo" && target.primary && !target.clipboard)
+    );
+    assert!(state.copy_feedback.is_none());
+    state.tick_copy_feedback(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    assert!(state
+        .selection
+        .as_ref()
+        .is_some_and(crate::selection::Selection::is_finalized));
+    assert_eq!(
+        state.selection.as_ref().unwrap().ordered_cells(),
+        ((0, 6), (0, 10))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_word_drag_retains_its_finalized_live_range() {
+    let mut state = word_drag_state(true);
+    state.config.copy_on_select = crate::config::CopyOnSelect::Primary;
+    let initial = start_word_drag(&mut state);
+    word_row_reply(&mut state, &initial, "alpha bravo charlie");
+    word_drag_mouse(&mut state, MouseEventKind::Drag(MouseButton::Left), 0, 16);
+    let copy = word_drag_mouse(&mut state, MouseEventKind::Up(MouseButton::Left), 0, 16);
+    assert!(state
+        .selection
+        .as_ref()
+        .is_some_and(crate::selection::Selection::is_finalized));
+    assert_eq!(
+        state.selection.as_ref().unwrap().ordered_cells(),
+        ((0, 6), (0, 18))
+    );
+    let copied = word_row_reply(&mut state, &word_read_id(&copy.actions), "bravo charlie");
+    assert!(
+        matches!(&copied[..], [ClientShellAction::ClipboardWrite { bytes, target }]
+        if bytes == b"bravo charlie" && target.primary && !target.clipboard)
+    );
+    assert!(state.copy_feedback.is_none());
+    let mut updated = state.pane_surface.clone().expect("pane surface");
+    updated.panes[0].content_revision += 1;
+    updated.frame.cells[7].symbol = "x".into();
+    state.set_pane_surface(updated);
+    state.tick_copy_feedback(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    assert_eq!(
+        state.selection.as_ref().unwrap().ordered_cells(),
+        ((0, 6), (0, 18))
+    );
+}
+
 fn word_drag_state(copy_on_select: bool) -> ClientShellState {
     let mut config = Config::default();
-    config.ui.copy_on_select = copy_on_select;
+    config.ui.copy_on_select = if copy_on_select {
+        crate::config::CopyOnSelect::Clipboard
+    } else {
+        crate::config::CopyOnSelect::Disabled
+    };
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
     state.set_snapshot(Box::new(snapshot()));
     let mut pane_surface = surface();
@@ -576,7 +658,7 @@ fn double_click_drag_waits_for_latest_row_before_copying() {
             "bravo charlie\ndelta echo foxtrot\ngolf hotel",
         );
         assert!(
-            matches!(&copied[..], [ClientShellAction::ClipboardWrite(bytes)]
+            matches!(&copied[..], [ClientShellAction::ClipboardWrite { bytes, target: crate::selection::ClipboardTarget::SYSTEM }]
             if bytes == b"bravo charlie\ndelta echo foxtrot\ngolf hotel")
         );
     }

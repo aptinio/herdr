@@ -647,6 +647,21 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     )
 }
 
+pub const fn primary_clipboard_supported() -> bool {
+    false
+}
+
+/// macOS has no PRIMARY selection clipboard.
+pub fn write_primary(_bytes: &[u8]) -> bool {
+    false
+}
+
+/// macOS has no PRIMARY selection clipboard, so a middle-click paste asking for
+/// it reads the system clipboard instead.
+pub fn read_primary() -> Option<String> {
+    read_clipboard_text()
+}
+
 pub fn read_clipboard_text() -> Option<String> {
     const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 

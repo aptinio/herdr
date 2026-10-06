@@ -146,13 +146,17 @@ impl ClientShellState {
                 selection.finish();
             }
             self.word_selection_gesture = None;
-            if self.config.copy_on_select {
-                self.request_selection_copy(outcome, false);
-                if dragged {
-                    self.selection = None;
-                } else {
-                    self.selection_highlight_clear_deadline =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+            if let Some(target) =
+                crate::selection::ClipboardTarget::from_copy_on_select(self.config.copy_on_select)
+            {
+                self.request_selection_copy(outcome, false, target);
+                if !target.is_primary_only() {
+                    if dragged {
+                        self.selection = None;
+                    } else {
+                        self.selection_highlight_clear_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+                    }
                 }
             }
         }

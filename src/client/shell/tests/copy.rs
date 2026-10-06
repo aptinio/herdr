@@ -209,7 +209,8 @@ fn client_mouse_selection_highlights_and_copies_through_endpoint_extraction() {
     assert!(repaint);
     assert!(matches!(
         &actions[..],
-        [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"LIV"
+        [ClientShellAction::ClipboardWrite { bytes, target }]
+            if bytes == b"LIV" && *target == crate::selection::ClipboardTarget::SYSTEM
     ));
     assert_eq!(
         state
@@ -221,10 +222,437 @@ fn client_mouse_selection_highlights_and_copies_through_endpoint_extraction() {
 }
 
 #[test]
+fn copy_on_select_targets_configured_clipboard_buffers() {
+    let cases = [
+        (
+            crate::config::CopyOnSelect::Clipboard,
+            crate::selection::ClipboardTarget::SYSTEM,
+        ),
+        (
+            crate::config::CopyOnSelect::Primary,
+            crate::selection::ClipboardTarget {
+                clipboard: false,
+                primary: true,
+            },
+        ),
+        (
+            crate::config::CopyOnSelect::Both,
+            crate::selection::ClipboardTarget {
+                clipboard: true,
+                primary: crate::platform::primary_clipboard_supported(),
+            },
+        ),
+    ];
+    for (mode, expected_target) in cases {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.config.copy_on_select = mode;
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(surface());
+        state.compose(106, 20).expect("composed frame");
+        let pane = state.hits.panes[0].clone();
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: pane.inner_rect.x + u16::from(matches!(kind, MouseEventKind::Drag(_))) * 2,
+                row: pane.inner_rect.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        }
+        let release =
+            state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: pane.inner_rect.x + 2,
+                row: pane.inner_rect.y,
+                modifiers: KeyModifiers::empty(),
+            })]);
+        if mode == crate::config::CopyOnSelect::Primary
+            && !crate::platform::primary_clipboard_supported()
+        {
+            assert!(release.actions.is_empty());
+            assert!(release.requests.is_empty());
+            assert!(state.selection.is_some());
+            continue;
+        }
+        let [ClientShellAction::Endpoint { request, .. }] = &release.actions[..] else {
+            panic!("mode {mode:?}: selection release should request endpoint extraction");
+        };
+        let request_id = request.id.clone();
+
+        let (_, actions) = state.handle_endpoint_result(
+            "boot-1",
+            &request_id,
+            Ok(crate::api::schema::ResponseResult::PaneSelection {
+                pane_id: "pane_1".into(),
+                text: "LIV".into(),
+            }),
+        );
+        assert!(
+            matches!(
+                &actions[..],
+                [ClientShellAction::ClipboardWrite { bytes, target }]
+                    if bytes == b"LIV" && *target == expected_target
+            ),
+            "mode {mode:?}: unexpected actions {actions:?}"
+        );
+    }
+}
+
+fn middle_click(state: &mut ClientShellState) -> ClientShellInput {
+    let pane = state.hits.panes[0].clone();
+    state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Middle),
+        column: pane.inner_rect.x,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })])
+}
+
+fn paste_source(outcome: &ClientShellInput) -> Option<crate::selection::PasteSource> {
+    outcome.actions.iter().find_map(|action| match action {
+        ClientShellAction::PasteClipboard { target, source } => {
+            assert!(matches!(target, ClientInputTarget::Pane(pane_id) if pane_id == "pane_1"));
+            Some(*source)
+        }
+        _ => None,
+    })
+}
+
+#[test]
+fn middle_click_paste_targets_configured_clipboard() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed frame");
+
+    state.config.paste_on_middle_click = crate::config::PasteOnMiddleClick::Disabled;
+    let outcome = middle_click(&mut state);
+    assert_eq!(paste_source(&outcome), None);
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.requests.is_empty());
+
+    state.config.paste_on_middle_click = crate::config::PasteOnMiddleClick::Primary;
+    let outcome = middle_click(&mut state);
+    assert_eq!(
+        paste_source(&outcome),
+        Some(crate::selection::PasteSource::Primary)
+    );
+    assert!(
+        outcome.actions.iter().any(|action| matches!(
+            action,
+            ClientShellAction::Endpoint { request, .. }
+                if matches!(
+                    &request.method,
+                    crate::api::schema::Method::PaneFocus(target) if target.pane_id == "pane_1"
+                )
+        )),
+        "middle-click paste should focus the pane it pastes into"
+    );
+
+    state.config.paste_on_middle_click = crate::config::PasteOnMiddleClick::Clipboard;
+    let outcome = middle_click(&mut state);
+    assert_eq!(
+        paste_source(&outcome),
+        Some(crate::selection::PasteSource::Clipboard)
+    );
+}
+
+#[test]
+fn middle_click_paste_defers_to_pane_apps_that_report_mouse() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.paste_on_middle_click = crate::config::PasteOnMiddleClick::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.panes[0].mouse_reporting = true;
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+
+    let outcome = middle_click(&mut state);
+    assert_eq!(paste_source(&outcome), None);
+    let [ClientMessage::ClientShellPaneInput { pane_id, events }] = &outcome.requests[..] else {
+        panic!("middle-click should be forwarded to the mouse-reporting pane app");
+    };
+    assert_eq!(pane_id, "pane_1");
+    assert!(matches!(
+        &events[..],
+        [ClientPaneInputEvent::Mouse {
+            kind: crate::protocol::ClientMouseKind::Down(
+                crate::protocol::ClientMouseButton::Middle
+            ),
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn middle_click_paste_is_suppressed_in_copy_mode() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.paste_on_middle_click = crate::config::PasteOnMiddleClick::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
+        offset_from_bottom: 0,
+        max_offset_from_bottom: 10,
+        viewport_rows: 2,
+    });
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+    assert!(state.enter_copy_mode(&mut ClientShellInput::default()));
+
+    let outcome = middle_click(&mut state);
+
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.requests.is_empty());
+    assert_eq!(state.mode, ClientShellMode::Copy);
+}
+
+#[test]
+fn ctrl_shift_c_is_forwarded_to_mouse_reporting_pane_without_herdr_selection() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.copy_on_select = crate::config::CopyOnSelect::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    let mut pane_surface = surface();
+    pane_surface.panes[0].mouse_reporting = true;
+    state.set_pane_surface(pane_surface);
+    state.compose(106, 20).expect("composed frame");
+
+    let forwarded =
+        state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))]);
+
+    assert!(forwarded.actions.is_empty());
+    assert!(matches!(
+        &forwarded.requests[..],
+        [ClientMessage::ClientShellPaneInput { events, .. }]
+            if matches!(
+                &events[..],
+                [ClientPaneInputEvent::Key { code: crate::protocol::ClientKeyCode::Char('c'), modifiers, .. }]
+                    if *modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT).bits()
+            )
+    ));
+}
+
+#[test]
+fn primary_drag_selection_remains_highlighted_after_release() {
+    let (mut state, _) = primary_drag_release();
+    assert!(state
+        .selection
+        .as_ref()
+        .is_some_and(crate::selection::Selection::is_finalized));
+    assert!(state.selection_highlight_clear_deadline.is_none());
+    state.tick_copy_feedback(std::time::Instant::now() + std::time::Duration::from_secs(3));
+    assert!(state
+        .selection
+        .as_ref()
+        .is_some_and(crate::selection::Selection::is_visible));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_drag_copy_completion_does_not_show_feedback() {
+    let (mut state, release) = primary_drag_release();
+    let [ClientShellAction::Endpoint { request, .. }] = &release.actions[..] else {
+        panic!("selection release should request the PRIMARY copy");
+    };
+    let (repaint, actions) = state.handle_endpoint_result(
+        "boot-1",
+        &request.id,
+        Ok(crate::api::schema::ResponseResult::PaneSelection {
+            pane_id: "pane_1".into(),
+            text: "LIV".into(),
+        }),
+    );
+    assert!(!repaint);
+    assert!(state.copy_feedback.is_none());
+    assert!(state.copy_feedback_deadline.is_none());
+    assert!(matches!(
+        &actions[..],
+        [ClientShellAction::ClipboardWrite { bytes, target }]
+            if bytes == b"LIV" && !target.clipboard && target.primary
+    ));
+}
+
+#[test]
+fn primary_explicit_copy_requests_the_system_clipboard() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.copy_on_select = crate::config::CopyOnSelect::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed frame");
+    let mut selection =
+        crate::selection::Selection::absolute_range("pane_1".into(), (0, 0), (0, 2));
+    assert!(selection.finish());
+    state.selection = Some(selection);
+    let copy = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))]);
+    assert!(copy.requests.is_empty());
+    let [ClientShellAction::Endpoint { request, .. }] = &copy.actions[..] else {
+        panic!("explicit copy should read the retained selection");
+    };
+    assert!(
+        matches!(&request.method, crate::api::schema::Method::PaneSelectionRead(params)
+        if params.content_revision.is_none())
+    );
+    let (_, actions) = state.handle_endpoint_result(
+        "boot-1",
+        &request.id,
+        Ok(crate::api::schema::ResponseResult::PaneSelection {
+            pane_id: "pane_1".into(),
+            text: "LIV".into(),
+        }),
+    );
+    assert!(state.selection.is_none());
+    assert!(matches!(
+        &actions[..],
+        [ClientShellAction::ClipboardWrite { bytes, target }]
+            if bytes == b"LIV" && *target == crate::selection::ClipboardTarget::SYSTEM
+    ));
+    assert!(state.copy_feedback.is_some());
+}
+
+#[test]
+fn primary_copy_chord_respects_direct_bindings() {
+    for retained in [false, true] {
+        let (mut state, _) = primary_drag_release();
+        if !retained {
+            state.selection = None;
+        }
+        state.config.keybinds.keybinds.detach =
+            crate::config::ActionKeybinds::direct("ctrl+shift+c");
+        let copy =
+            state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ))]);
+        assert!(copy.detach, "retained={retained}");
+        assert!(copy.actions.is_empty());
+        assert!(copy.requests.is_empty());
+        assert!(state.selection.is_none());
+    }
+}
+
+#[test]
+fn primary_copy_chord_respects_the_prefix_binding() {
+    for retained in [false, true] {
+        let (mut state, _) = primary_drag_release();
+        if !retained {
+            state.selection = None;
+        }
+        state.config.keybinds.prefix = vec![(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )];
+        let copy =
+            state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ))]);
+        assert_eq!(state.mode, ClientShellMode::Prefix, "retained={retained}");
+        assert!(copy.actions.is_empty());
+        assert!(copy.requests.is_empty());
+        assert!(state.selection.is_none());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_selection_does_not_turn_ctrl_c_into_a_copy_shortcut() {
+    let (mut state, _) = primary_drag_release();
+    let interrupt = state.handle_raw_events(vec![RawInputEvent::Key(
+        crate::input::TerminalKey::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )]);
+    assert!(state.selection.is_none());
+    assert!(interrupt.actions.is_empty());
+    assert!(matches!(
+        &interrupt.requests[..],
+        [ClientMessage::ClientShellPaneInput { events, .. }]
+            if matches!(&events[..], [ClientPaneInputEvent::Key { modifiers, .. }]
+                if *modifiers == KeyModifiers::CONTROL.bits())
+    ));
+}
+
+#[test]
+fn primary_retained_drag_uses_live_coordinates_after_output() {
+    let (mut state, _) = primary_drag_release();
+    let mut updated = surface();
+    updated.panes[0].content_revision += 1;
+    state.set_pane_surface(updated);
+    state.compose(106, 20).expect("updated frame");
+    assert!(state
+        .selection
+        .as_ref()
+        .is_some_and(crate::selection::Selection::is_visible));
+    let copy = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))]);
+    assert!(copy.requests.is_empty());
+    assert!(matches!(
+        &copy.actions[..],
+        [ClientShellAction::Endpoint { request, .. }]
+            if matches!(&request.method, crate::api::schema::Method::PaneSelectionRead(params)
+                if params.content_revision.is_none()
+                    && params.anchor == crate::api::schema::PaneTextPoint { row: 0, col: 0 }
+                    && params.cursor == crate::api::schema::PaneTextPoint { row: 0, col: 2 })
+    ));
+}
+
+#[test]
+fn primary_copy_chord_is_consumed_without_a_selection_or_mouse_reporting() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.copy_on_select = crate::config::CopyOnSelect::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed frame");
+    let copy = state.handle_raw_events(vec![RawInputEvent::Key(crate::input::TerminalKey::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))]);
+    assert!(copy.requests.is_empty());
+    assert!(copy.actions.is_empty());
+}
+
+fn primary_drag_release() -> (ClientShellState, ClientShellInput) {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.config.copy_on_select = crate::config::CopyOnSelect::Primary;
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("composed frame");
+    let pane = state.hits.panes[0].clone();
+    for (kind, column) in [
+        (MouseEventKind::Down(MouseButton::Left), pane.inner_rect.x),
+        (
+            MouseEventKind::Drag(MouseButton::Left),
+            pane.inner_rect.x + 2,
+        ),
+    ] {
+        state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+            kind,
+            column,
+            row: pane.inner_rect.y,
+            modifiers: KeyModifiers::empty(),
+        })]);
+    }
+    let release = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: pane.inner_rect.x + 2,
+        row: pane.inner_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    (state, release)
+}
+
+#[test]
 fn clipboard_feedback_is_client_local_and_respects_config() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     let now = std::time::Instant::now();
-    assert!(state.show_copy_feedback(now));
+    assert!(state.show_copy_feedback(now, crate::selection::ClipboardTarget::SYSTEM));
     assert_eq!(
         state
             .copy_feedback
@@ -240,7 +668,7 @@ fn clipboard_feedback_is_client_local_and_respects_config() {
     state.config.clipboard_toast_enabled = false;
     state.copy_feedback = None;
     state.copy_feedback_deadline = None;
-    assert!(!state.show_copy_feedback(now));
+    assert!(!state.show_copy_feedback(now, crate::selection::ClipboardTarget::SYSTEM));
     assert!(state.copy_feedback.is_none());
     assert!(state.copy_feedback_deadline.is_none());
 }
@@ -248,7 +676,7 @@ fn clipboard_feedback_is_client_local_and_respects_config() {
 #[test]
 fn retained_mouse_selection_survives_output_and_copies_without_terminal_input() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.config.copy_on_select = false;
+    state.config.copy_on_select = crate::config::CopyOnSelect::Disabled;
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     state.compose(106, 20).expect("composed frame");
@@ -344,7 +772,11 @@ fn retained_mouse_selection_survives_output_and_copies_without_terminal_input() 
             text: "yIV".into(),
         }),
     );
-    assert!(matches!(&actions[..], [ClientShellAction::ClipboardWrite(bytes)] if bytes == b"yIV"));
+    assert!(matches!(
+        &actions[..],
+        [ClientShellAction::ClipboardWrite { bytes, target }]
+            if bytes == b"yIV" && *target == crate::selection::ClipboardTarget::SYSTEM
+    ));
 }
 
 #[test]
@@ -405,7 +837,7 @@ fn selection_edge_drag_requests_scroll_and_timer_continues_it() {
 #[test]
 fn keyboard_copy_mode_owns_cursor_selection_copy_and_scroll_restore() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.config.copy_on_select = false;
+    state.config.copy_on_select = crate::config::CopyOnSelect::Disabled;
     state.set_snapshot(Box::new(snapshot()));
     let mut pane_surface = surface();
     pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
@@ -1805,7 +2237,7 @@ fn navigator_owns_search_mouse_selection_and_stable_target_focus() {
 #[test]
 fn copy_mode_survives_mouse_motion_and_parks_across_focus_changes() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.config.copy_on_select = false;
+    state.config.copy_on_select = crate::config::CopyOnSelect::Disabled;
     state.set_snapshot(Box::new(snapshot()));
     let mut pane_surface = surface();
     pane_surface.panes[0].scroll = Some(crate::protocol::PaneSurfaceScrollMetrics {
@@ -1938,7 +2370,7 @@ fn copy_mode_survives_mouse_motion_and_parks_across_focus_changes() {
 #[test]
 fn retained_selection_copy_suppresses_key_repeats() {
     let mut config = Config::default();
-    config.ui.copy_on_select = false;
+    config.ui.copy_on_select = crate::config::CopyOnSelect::Disabled;
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());

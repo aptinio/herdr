@@ -309,17 +309,19 @@ fn dispatcher_cancels_worktree_requests_on_frozen_surface_or_failed_send() {
         endpoints.set_surface_active(&ClientEndpointId::Local, fail_send);
         let mut commands = EndpointCommands::default();
         let mut scheduled = None;
-        let (replay, repaint) = crate::client::shell_runtime::dispatch_client_shell_actions(
-            actions,
-            &mut commands,
-            &mut endpoints,
-            Some(&mut state),
-            &mut Vec::new(),
-            &mut scheduled,
-        )
-        .unwrap();
+        let (replay, repaint, requests) =
+            crate::client::shell_runtime::dispatch_client_shell_actions(
+                actions,
+                &mut commands,
+                &mut endpoints,
+                Some(&mut state),
+                &mut Vec::new(),
+                &mut scheduled,
+            )
+            .unwrap();
         assert!(repaint);
         assert!(replay.is_empty());
+        assert!(requests.is_empty());
         assert!(state.pending_requests.is_empty());
         assert!(matches!(
             &state.overlay,
@@ -425,7 +427,11 @@ fn failed_selection_copy_does_not_send_terminal_input() {
         }),
     ] {
         let mut outcome = ClientShellInput::default();
-        state.request_selection_copy(&mut outcome, false);
+        state.request_selection_copy(
+            &mut outcome,
+            false,
+            crate::selection::ClipboardTarget::SYSTEM,
+        );
         let (_, actions) =
             state.handle_endpoint_result("boot-1", request_id(&outcome.actions), result);
         assert!(actions.is_empty());

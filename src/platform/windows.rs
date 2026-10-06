@@ -2723,7 +2723,34 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     }
 }
 
+pub const fn primary_clipboard_supported() -> bool {
+    false
+}
+
+/// Windows has no PRIMARY selection clipboard.
+pub fn write_primary(_bytes: &[u8]) -> bool {
+    false
+}
+
+/// Windows has no PRIMARY selection clipboard, so a middle-click paste asking
+/// for it reads the system clipboard instead.
+pub fn read_primary() -> Option<String> {
+    read_clipboard_text()
+}
+
 pub fn read_clipboard_text() -> Option<String> {
+    const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+
+    for attempt in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let _clipboard = ClipboardGuard;
+            let bytes = clipboard_global_bytes(CF_UNICODETEXT as u32, MAX_CLIPBOARD_TEXT_BYTES)?;
+            return decode_unicode_clipboard(&bytes);
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     None
 }
 
@@ -2731,8 +2758,6 @@ pub fn read_clipboard_text() -> Option<String> {
 ///
 /// Returns `None` when the clipboard changed since our last write, cannot be read,
 /// or has non-text formats.
-/// Kept separate from [`read_clipboard_text`] so unsupported modal paste on
-/// Windows is unchanged.
 pub fn clipboard_text_matches(bytes: &[u8]) -> Option<bool> {
     let current = read_clipboard_unicode_text()?;
     Some(clipboard_text_equals(&current, bytes))
@@ -2795,6 +2820,18 @@ fn read_clipboard_unicode_text() -> Option<String> {
         }
     }
     None
+}
+
+fn decode_unicode_clipboard(bytes: &[u8]) -> Option<String> {
+    if !bytes.len().is_multiple_of(size_of::<u16>()) {
+        return None;
+    }
+    let text = bytes
+        .chunks_exact(size_of::<u16>())
+        .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    String::from_utf16(&text).ok()
 }
 
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
@@ -3587,6 +3624,17 @@ mod tests {
             super::prepare_paste_text_for_pty_platform("one\ntwo\r\nthree\rfour".to_owned()),
             "one\r\ntwo\r\nthree\rfour"
         );
+    }
+
+    #[test]
+    fn unicode_clipboard_decoder_reads_utf16_through_first_nul() {
+        let bytes = [0x61, 0x00, 0x3d, 0xd8, 0x42, 0xde, 0x00, 0x00, 0x78, 0x00];
+        assert_eq!(
+            super::decode_unicode_clipboard(&bytes).as_deref(),
+            Some("a🙂")
+        );
+        assert_eq!(super::decode_unicode_clipboard(&bytes[..9]), None);
+        assert_eq!(super::decode_unicode_clipboard(&[0x00, 0xd8]), None);
     }
 
     #[test]

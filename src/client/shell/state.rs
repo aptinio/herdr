@@ -29,7 +29,8 @@ pub(crate) struct ClientShellConfig {
     pub(super) toast_delivery: crate::config::ToastDelivery,
     pub(super) toast_delay_seconds: u64,
     pub(super) toast_position: crate::config::ToastHerdrPosition,
-    pub(super) copy_on_select: bool,
+    pub(super) copy_on_select: crate::config::CopyOnSelect,
+    pub(super) paste_on_middle_click: crate::config::PasteOnMiddleClick,
     pub(super) clipboard_toast_enabled: bool,
     pub(super) clipboard_toast_position: crate::config::ToastClipboardPosition,
     pub(super) theme_name: String,
@@ -246,7 +247,18 @@ pub(crate) enum ClientShellAction {
         boot_id: String,
         request: Box<crate::api::schema::Request>,
     },
-    ClipboardWrite(Vec<u8>),
+    /// Write `bytes` to the local clipboard buffers named by `target`.
+    ClipboardWrite {
+        bytes: Vec<u8>,
+        target: crate::selection::ClipboardTarget,
+    },
+    /// Read the local clipboard buffer named by `source` and paste it into
+    /// `target`. Herdr captures the mouse, so the host terminal never performs
+    /// its own middle-click paste while Herdr runs; this restores it.
+    PasteClipboard {
+        target: ClientInputTarget,
+        source: crate::selection::PasteSource,
+    },
     OpenSafeWebUrl(String),
     ActivateEndpoint {
         endpoint_id: ClientEndpointId,
@@ -642,7 +654,9 @@ pub(super) enum PendingEndpointKind {
     WorktreeRemove {
         forced: bool,
     },
-    SelectionCopy,
+    SelectionCopy {
+        target: crate::selection::ClipboardTarget,
+    },
     PaneScroll {
         pane_id: String,
         serial: u64,
@@ -750,7 +764,7 @@ pub(super) struct ClientVisibleNotification {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum ClientInputTarget {
+pub(crate) enum ClientInputTarget {
     Pane(String),
     Popup(String),
 }
@@ -1819,12 +1833,21 @@ impl ClientShellState {
         }
     }
 
-    pub(crate) fn show_copy_feedback(&mut self, now: std::time::Instant) -> bool {
-        if !self.config.clipboard_toast_enabled {
+    pub(crate) fn show_copy_feedback(
+        &mut self,
+        now: std::time::Instant,
+        target: crate::selection::ClipboardTarget,
+    ) -> bool {
+        if !self.config.clipboard_toast_enabled || target.is_primary_only() {
             return false;
         }
         self.copy_feedback = Some(crate::app::state::CopyFeedback {
-            message: "copied to clipboard".to_owned(),
+            message: if target.clipboard && target.primary {
+                "copied to clipboards"
+            } else {
+                "copied to clipboard"
+            }
+            .to_owned(),
         });
         self.copy_feedback_deadline = Some(now + std::time::Duration::from_secs(2));
         true

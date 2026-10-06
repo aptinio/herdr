@@ -858,6 +858,19 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     false
 }
 
+pub const fn primary_clipboard_supported() -> bool {
+    true
+}
+
+pub fn write_primary(bytes: &[u8]) -> bool {
+    for command in primary_clipboard_commands() {
+        if run_clipboard_command(&command, bytes) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn read_clipboard_text() -> Option<String> {
     for command in read_clipboard_text_commands() {
         if let Some(text) = read_clipboard_text_with_command(&command) {
@@ -868,6 +881,21 @@ pub fn read_clipboard_text() -> Option<String> {
 }
 
 pub fn clipboard_text_matches(_bytes: &[u8]) -> Option<bool> {
+    None
+}
+
+/// Read the PRIMARY selection, the buffer middle-click pastes from.
+///
+/// Returns `None` when no selection tool is reachable or PRIMARY is empty, in
+/// which case the caller pastes nothing rather than falling back to CLIPBOARD;
+/// silently pasting a different buffer than the one asked for is worse than
+/// doing nothing.
+pub fn read_primary() -> Option<String> {
+    for command in read_primary_commands() {
+        if let Some(text) = read_clipboard_text_with_command(&command) {
+            return Some(text);
+        }
+    }
     None
 }
 
@@ -1078,17 +1106,82 @@ fn clipboard_commands() -> Vec<ClipboardCommand> {
     commands
 }
 
+/// Commands that write to the PRIMARY selection (middle-click paste buffer).
+fn primary_clipboard_commands() -> Vec<ClipboardCommand> {
+    let mut commands = Vec::new();
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "wl-copy",
+            args: &["--primary", "--type", "text/plain;charset=utf-8"],
+        });
+    }
+
+    if std::env::var_os("DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "xclip",
+            args: &["-selection", "primary", "-in"],
+        });
+        commands.push(ClipboardCommand {
+            program: "xsel",
+            args: &["--primary", "--input"],
+        });
+    }
+
+    commands
+}
+
+/// Commands that read the PRIMARY selection (middle-click paste buffer).
+///
+/// `wl-paste` appends a newline to text output unless `--no-newline` is passed,
+/// which would turn a pasted command into a submitted one. The flag suppresses
+/// only the appended newline; newlines inside the selection survive.
+fn read_primary_commands() -> Vec<ClipboardCommand> {
+    let mut commands = Vec::new();
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "wl-paste",
+            args: &[
+                "--primary",
+                "--no-newline",
+                "--type",
+                "text/plain;charset=utf-8",
+            ],
+        });
+        commands.push(ClipboardCommand {
+            program: "wl-paste",
+            args: &["--primary", "--no-newline", "--type", "text/plain"],
+        });
+    }
+
+    if std::env::var_os("DISPLAY").is_some() {
+        commands.push(ClipboardCommand {
+            program: "xclip",
+            args: &["-selection", "primary", "-out"],
+        });
+        commands.push(ClipboardCommand {
+            program: "xsel",
+            args: &["--primary", "--output"],
+        });
+    }
+
+    commands
+}
+
+/// Commands that read the system clipboard. `--no-newline` matters here for the
+/// same reason it does in [`read_primary_commands`].
 fn read_clipboard_text_commands() -> Vec<ClipboardCommand> {
     let mut commands = Vec::new();
 
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         commands.push(ClipboardCommand {
             program: "wl-paste",
-            args: &["--type", "text/plain;charset=utf-8"],
+            args: &["--no-newline", "--type", "text/plain;charset=utf-8"],
         });
         commands.push(ClipboardCommand {
             program: "wl-paste",
-            args: &["--type", "text/plain"],
+            args: &["--no-newline", "--type", "text/plain"],
         });
     }
 
@@ -2013,6 +2106,45 @@ mod tests {
         assert_eq!(commands[1].program, "wl-paste");
         assert_eq!(commands[2].program, "xclip");
         assert_eq!(commands[3].program, "xsel");
+    }
+
+    #[test]
+    fn wl_paste_reads_suppress_the_appended_newline() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        for commands in [read_primary_commands(), read_clipboard_text_commands()] {
+            for command in commands
+                .iter()
+                .filter(|command| command.program == "wl-paste")
+            {
+                assert!(
+                    command.args.contains(&"--no-newline"),
+                    "wl-paste read is missing --no-newline: {:?}",
+                    command.args
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn read_primary_commands_target_the_primary_selection() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+            std::env::set_var("DISPLAY", ":0");
+        }
+
+        let commands = read_primary_commands();
+        assert_eq!(commands[0].program, "wl-paste");
+        assert!(commands[0].args.contains(&"--primary"));
+        assert_eq!(commands[2].program, "xclip");
+        assert!(commands[2].args.contains(&"primary"));
+        assert_eq!(commands[3].program, "xsel");
+        assert!(commands[3].args.contains(&"--primary"));
     }
 
     #[test]

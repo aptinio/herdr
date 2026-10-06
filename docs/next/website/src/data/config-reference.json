@@ -913,9 +913,26 @@
         },
         {
           "key": "ui.copy_on_select",
-          "type": "boolean",
+          "type": "enum",
           "default": "true",
-          "description": "Automatically copy text selected by mouse drag or double-click. When disabled, Ctrl+C or a host-forwarded Cmd+C copies and clears the retained selection."
+          "description": "Automatically copy text selected by mouse drag or double-click. Booleans are accepted: true is \"clipboard\" (system clipboard) and false is \"disabled\". \"primary\" copies to the selection clipboard only (PRIMARY, middle-click paste on Linux); on platforms without PRIMARY it leaves the selection visible without copying. \"both\" copies to both clipboards where PRIMARY is available and to the system clipboard elsewhere. PRIMARY-only selections remain visible after auto-copy. When copy-on-select is disabled, Ctrl+C, a host-forwarded Ctrl+Shift+C, or a host-forwarded Cmd+C copies and clears a retained selection to the system clipboard. With \"primary\", a host-forwarded Ctrl+Shift+C performs that explicit copy while plain Ctrl+C retains its pane-input behavior on platforms with PRIMARY; platforms without PRIMARY retain the existing Ctrl+C and host-forwarded Cmd+C explicit copy shortcuts. In either retaining mode, a host-forwarded Ctrl+Shift+C received with distinct modifiers and no retained Herdr selection is forwarded to a focused pane app that reports mouse input; otherwise it is consumed without pane input. A configured Herdr direct binding or prefix takes precedence over host-forwarded Ctrl+Shift+C in ordinary terminal routing; popup input keeps its normal precedence.",
+          "values": [
+            "disabled",
+            "clipboard",
+            "primary",
+            "both"
+          ]
+        },
+        {
+          "key": "ui.paste_on_middle_click",
+          "type": "enum",
+          "default": "false",
+          "description": "Paste into the pane under the cursor on middle-click. Herdr captures the mouse, so the host terminal never performs its own middle-click paste while Herdr runs. Booleans are accepted: true is \"primary\" (the selection clipboard, PRIMARY on Linux) and false is \"disabled\". \"clipboard\" pastes the system clipboard. macOS and Windows have no selection clipboard, so \"primary\" reads the system clipboard there. Pane apps that requested mouse reporting keep receiving the middle-click instead of pasting.",
+          "values": [
+            "disabled",
+            "primary",
+            "clipboard"
+          ]
         },
         {
           "key": "ui.host_cursor",
