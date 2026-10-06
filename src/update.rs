@@ -29,6 +29,9 @@ const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
+const PRIVATE_PACKAGE_UPDATE_COMMAND: &str = "rebuild and install the private package with pacman";
+const PRIVATE_PACKAGE_UPDATE_GUIDANCE: &str =
+    "Rebuild and install the private package with pacman; stock updates would remove its customizations.";
 const MISE_INSTALLS_DIR_ENV: &str = "MISE_INSTALLS_DIR";
 const FAKE_UPDATE_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_VERSION";
 const FAKE_UPDATE_NOTES_VERSION_ENV: &str = "HERDR_FAKE_UPDATE_NOTES_VERSION";
@@ -1882,7 +1885,9 @@ fn print_running_session_update_outcomes(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn update_install_command() -> &'static str {
-    if is_homebrew_managed_install() {
+    if crate::build_info::private_package().is_some() {
+        PRIVATE_PACKAGE_UPDATE_COMMAND
+    } else if is_homebrew_managed_install() {
         HOMEBREW_UPDATE_COMMAND
     } else if is_mise_managed_install() {
         MISE_UPDATE_COMMAND
@@ -1907,6 +1912,9 @@ pub(crate) fn update_install_instruction(install_command: &str) -> String {
         }
         NIX_UPDATE_COMMAND => {
             "detach, update through Nix, then run Herdr again to reconnect".to_string()
+        }
+        PRIVATE_PACKAGE_UPDATE_COMMAND => {
+            "detach, rebuild and install the private package with pacman, then run Herdr again to reconnect".to_string()
         }
         command => format!("detach, run `{command}`, then run Herdr again to reconnect"),
     }
@@ -1937,6 +1945,9 @@ fn is_mise_managed_install() -> bool {
 }
 
 pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static str> {
+    if crate::build_info::private_package().is_some() {
+        return Some("preview channel is not available for private package builds; rebuild the private source instead");
+    }
     let Ok(current_exe) = env::current_exe() else {
         return None;
     };
@@ -1946,7 +1957,9 @@ pub(crate) fn preview_channel_rejection_for_current_install() -> Option<&'static
 
 pub(crate) fn package_manager_channel_update_guidance_for_current_install() -> Option<&'static str>
 {
-    if is_homebrew_managed_install() {
+    if crate::build_info::private_package().is_some() {
+        Some(PRIVATE_PACKAGE_UPDATE_GUIDANCE)
+    } else if is_homebrew_managed_install() {
         Some("Use `brew update && brew upgrade herdr` to update Homebrew installs.")
     } else if is_mise_managed_install() {
         Some("Use `mise upgrade herdr` to update mise installs.")
@@ -2107,6 +2120,11 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 
 /// Manual self-update command (`herdr update`).
 pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+    if let Some(package) = crate::build_info::private_package() {
+        return Err(format!(
+            "self-update is disabled for private package {package}; {PRIVATE_PACKAGE_UPDATE_GUIDANCE}"
+        ));
+    }
     let channel = UpdateChannel::configured();
 
     if is_homebrew_managed_install() {
@@ -2346,6 +2364,9 @@ fn print_outdated_integration_notice_with_updated_binary(updated_exe: &Path) {
 /// Background update check: only surface availability and release notes.
 /// Runs in a background thread at startup.
 pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
+    if crate::build_info::private_package().is_some() {
+        return;
+    }
     crate::logging::update_check_started();
     if let Ok(version) = env::var(FAKE_UPDATE_VERSION_ENV) {
         let version = version.trim();
@@ -2510,6 +2531,109 @@ mod tests {
     };
     use std::sync::{Mutex, OnceLock};
     use std::thread;
+
+    #[test]
+    fn private_package_manual_update_is_disabled() {
+        if option_env!("HERDR_BUILD_PACKAGE").is_none() {
+            assert_ne!(
+                update_install_command(),
+                "rebuild and install the private package with pacman"
+            );
+            return;
+        }
+
+        let _guard = env_lock().lock().unwrap();
+        let previous = env::var_os("HERDR_ENV");
+        // Avoid network/install activity even if the private-package guard regresses.
+        env::set_var("HERDR_ENV", "1");
+        let errors = [false, true].map(|handoff| {
+            self_update(SelfUpdateOptions {
+                live_handoff: handoff,
+            })
+            .unwrap_err()
+        });
+        match previous {
+            Some(value) => env::set_var("HERDR_ENV", value),
+            None => env::remove_var("HERDR_ENV"),
+        }
+        for error in errors {
+            assert!(
+                error.contains("self-update is disabled for private package"),
+                "{error}"
+            );
+            assert!(
+                error.contains(crate::build_info::private_package().unwrap()),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_package_channel_and_install_guidance_preserve_customizations() {
+        if option_env!("HERDR_BUILD_PACKAGE").is_none() {
+            assert_ne!(
+                update_install_command(),
+                "rebuild and install the private package with pacman"
+            );
+            return;
+        }
+
+        assert!(preview_channel_rejection_for_current_install()
+            .is_some_and(|message| message.contains("private package")));
+        assert!(
+            package_manager_channel_update_guidance_for_current_install().is_some_and(|message| {
+                message.contains("private package") && message.contains("pacman")
+            })
+        );
+        assert_eq!(
+            update_install_command(),
+            "rebuild and install the private package with pacman"
+        );
+        assert!(update_install_instruction(update_install_command()).contains("rebuild"));
+        assert!(!update_install_instruction(update_install_command()).contains("`herdr update`"));
+    }
+
+    #[test]
+    fn private_package_background_update_has_no_stock_notice_or_notes() {
+        if option_env!("HERDR_BUILD_PACKAGE").is_none() {
+            assert_ne!(
+                update_install_command(),
+                "rebuild and install the private package with pacman"
+            );
+            return;
+        }
+
+        let _guard = env_lock().lock().unwrap();
+        let root =
+            env::temp_dir().join(format!("herdr-private-update-test-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let previous_config = env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        let previous_fake = env::var_os(FAKE_UPDATE_VERSION_ENV);
+        env::set_var(crate::config::CONFIG_PATH_ENV_VAR, root.join("config.toml"));
+        env::set_var(FAKE_UPDATE_VERSION_ENV, "9999.0.0");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        auto_update(sender);
+        let notice = receiver.try_recv();
+        let notes_exist = crate::release_notes::pending_path().exists();
+        for (key, value) in [
+            (crate::config::CONFIG_PATH_ENV_VAR, previous_config),
+            (FAKE_UPDATE_VERSION_ENV, previous_fake),
+        ] {
+            match value {
+                Some(value) => env::set_var(key, value),
+                None => env::remove_var(key),
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            notice.is_err(),
+            "private package must not advertise stock updates"
+        );
+        assert!(
+            !notes_exist,
+            "private package must not save stock update notes"
+        );
+    }
 
     fn saved_machine(
         label: &str,

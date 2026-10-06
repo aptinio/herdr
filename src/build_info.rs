@@ -10,6 +10,11 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+/// Package builds must keep their private source changes during updates.
+pub fn private_package() -> Option<&'static str> {
+    non_empty(option_env!("HERDR_BUILD_PACKAGE"))
+}
+
 pub fn version() -> String {
     match channel() {
         "stable" => BASE_VERSION.to_string(),
