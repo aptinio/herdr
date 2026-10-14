@@ -318,17 +318,18 @@ impl ClientShellState {
         })
     }
 
+    /// Returns whether a hovered link was underlined.
     pub(super) fn render_link_hover(
         &self,
         frame: &mut FrameData,
         occlusion: &mut crate::kitty_graphics::surface::Occlusion,
-    ) {
+    ) -> bool {
         let Some(hover) = self
             .link_hover
             .as_ref()
             .filter(|hover| self.link_hover_target_current(&hover.target))
         else {
-            return;
+            return false;
         };
         let rect = hover.target.inner_rect;
         for region in &hover.regions {
@@ -361,6 +362,28 @@ impl ClientShellState {
                 }
             }
         }
+        !hover.regions.is_empty()
+    }
+
+    /// Returns whether any underlined hover cell survived the overlays drawn after it, so the
+    /// host pointer shape follows the visible hover.
+    pub(super) fn link_hover_still_underlined(&self, frame: &FrameData) -> bool {
+        let Some(hover) = self.link_hover.as_ref() else {
+            return false;
+        };
+        let rect = hover.target.inner_rect;
+        hover.regions.iter().any(|region| {
+            let row = rect.y.saturating_add(region.row);
+            row < frame.height
+                && (region.start_col..=region.end_col).any(|col| {
+                    let col = rect.x.saturating_add(col);
+                    col < frame.width
+                        && frame
+                            .cells
+                            .get(usize::from(row) * usize::from(frame.width) + usize::from(col))
+                            .is_some_and(|cell| cell.modifier & Modifier::UNDERLINED.bits() != 0)
+                })
+        })
     }
 }
 

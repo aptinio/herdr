@@ -704,6 +704,8 @@ fn restore_terminal_state(
         DisableFocusChange,
         DisableBracketedPaste
     );
+    // A hovered link may have left the host pointer shape changed.
+    let _ = crate::terminal_modes::set_host_link_pointer(&mut io::stdout(), false);
     let _ = set_mouse_capture(false, false);
     #[cfg(windows)]
     if let Some(mode) = restore_windows_input_mode {

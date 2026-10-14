@@ -78,6 +78,8 @@ pub(super) struct ClientState {
     /// Latest explicit Local selection awaiting this client's replacement Local connection.
     pub(super) deferred_local_activation: Option<endpoint::EndpointActivationIntent>,
     pub(super) draw_host_cursor: bool,
+    /// Last OSC 22 pointer shape written for a hovered link.
+    pub(super) host_link_pointer: bool,
     pub(super) detached_process_children: Vec<std::process::Child>,
     pub(super) shell: Option<shell::ClientShellState>,
 }
@@ -139,6 +141,7 @@ impl ClientState {
             presentation_frozen: false,
             deferred_local_activation: None,
             draw_host_cursor: false,
+            host_link_pointer: false,
             detached_process_children: Vec::new(),
             shell: Some(shell::ClientShellState::new(
                 shell::ClientShellConfig::from_config(&crate::config::Config::default()),
@@ -564,6 +567,7 @@ impl ClientState {
         let frame_output::ComposedFrame {
             frame: mut frame_data,
             graphics,
+            link_pointer,
         } = frame_data.into();
         // With capture enabled, host OSC 8 can intercept Ctrl-click before plugins.
         // Keep semantic links internally and restore native links when capture is off.
@@ -581,7 +585,16 @@ impl ClientState {
         } else {
             self.blit_encoder.encode(&frame_data, self.repaint_pending)
         };
-        if let Err(error) = self.write_composed_output(writer, &encoded.bytes, graphics) {
+        // The pointer shape reaches the host once written, even if the frame write then fails.
+        let pointer_result = if link_pointer == self.host_link_pointer {
+            Ok(())
+        } else {
+            crate::terminal_modes::set_host_link_pointer(writer, link_pointer)
+                .map(|()| self.host_link_pointer = link_pointer)
+        };
+        if let Err(error) = pointer_result
+            .and_then(|()| self.write_composed_output(writer, &encoded.bytes, graphics))
+        {
             tracing::warn!(%error, "failed to present client frame");
             self.repaint_pending = true;
             return false;
@@ -854,6 +867,79 @@ mod native_cleanup_tests {
         state.flush_native_cleanup(&mut output).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap().matches("a=d,").count(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod link_pointer_tests {
+    use super::*;
+
+    const LINK_POINTER: &str = "\x1b]22;pointer\x1b\\";
+    const DEFAULT_POINTER: &str = "\x1b]22;default\x1b\\";
+
+    /// Accepts the given number of writes, then fails.
+    struct FailingWriter(usize);
+
+    impl io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.0 == 0 {
+                return Err(io::Error::other("closed"));
+            }
+            self.0 -= 1;
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn frame(link_pointer: bool) -> frame_output::ComposedFrame {
+        let mut frame: frame_output::ComposedFrame =
+            crate::protocol::FrameData::from_ratatui_buffer(
+                &ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1, 1)),
+                None,
+            )
+            .into();
+        frame.link_pointer = link_pointer;
+        frame
+    }
+
+    fn present(state: &mut ClientState, link_pointer: bool) -> String {
+        let mut output = Vec::new();
+        assert!(state.try_present_frame_to(&mut output, frame(link_pointer)));
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn link_pointer_is_written_only_when_the_presented_shape_changes() {
+        let mut state = ClientState::test_new();
+        assert!(!present(&mut state, false).contains("\x1b]22;"));
+        assert_eq!(present(&mut state, true).matches(LINK_POINTER).count(), 1);
+        assert!(!present(&mut state, true).contains("\x1b]22;"));
+        assert_eq!(
+            present(&mut state, false).matches(DEFAULT_POINTER).count(),
+            1
+        );
+        assert!(!present(&mut state, false).contains("\x1b]22;"));
+    }
+
+    #[test]
+    fn failed_presentation_retries_the_link_pointer() {
+        let mut state = ClientState::test_new();
+        assert!(!state.try_present_frame_to(&mut FailingWriter(0), frame(true)));
+        assert!(!state.host_link_pointer);
+        assert_eq!(present(&mut state, true).matches(LINK_POINTER).count(), 1);
+    }
+
+    #[test]
+    fn link_pointer_written_before_a_failed_frame_is_restored_later() {
+        let mut state = ClientState::test_new();
+        assert!(!state.try_present_frame_to(&mut FailingWriter(1), frame(true)));
+        assert_eq!(
+            present(&mut state, false).matches(DEFAULT_POINTER).count(),
             1
         );
     }

@@ -412,7 +412,7 @@ impl ClientShellState {
             }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
-        self.render_link_hover(&mut frame, &mut occlusion);
+        let link_hover_drawn = self.render_link_hover(&mut frame, &mut occlusion);
         if self.mode == ClientShellMode::Copy {
             frame.cursor = None;
             if let Some(copy_mode) = self.copy_mode.as_ref() {
@@ -720,8 +720,13 @@ impl ClientShellState {
             self.hits.pane_splits.clear();
             self.hits.popup = None;
         }
+        let link_pointer = link_hover_drawn && self.link_hover_still_underlined(&frame);
         let graphics = self.compose_graphics(layout, &occlusion);
-        Some(crate::client::frame_output::ComposedFrame { frame, graphics })
+        Some(crate::client::frame_output::ComposedFrame {
+            frame,
+            graphics,
+            link_pointer,
+        })
     }
 }
 

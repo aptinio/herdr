@@ -61,8 +61,10 @@ fn ctrl_hover_underlines_wrapped_segments_and_caches_the_link() {
     let mut state = hover_state();
     let mouse = hover_mouse(&state, 1, 0);
     let id = hover_request(&state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]));
+    assert!(!state.compose(106, 20).unwrap().link_pointer);
     assert!(resolve_hover(&mut state, &id));
     let frame = state.compose(106, 20).unwrap();
+    assert!(frame.link_pointer);
     let pane = &state.hits.panes[0];
     let underlined = |col, row| {
         frame.cells[usize::from(pane.inner_rect.y + row) * usize::from(frame.width)
@@ -184,7 +186,64 @@ fn ctrl_hover_clears_on_release_content_change_and_focus_loss() {
             }
         }
         assert!(state.link_hover.is_none());
+        assert!(!state.compose(106, 20).unwrap().link_pointer);
     }
+}
+
+#[test]
+fn ctrl_hover_pointer_follows_overlays_that_cover_the_link() {
+    let mut state = hover_state();
+    let mouse = hover_mouse(&state, 1, 0);
+    let id = hover_request(&state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]));
+    assert!(resolve_hover(&mut state, &id));
+    assert!(state.compose(106, 20).unwrap().link_pointer);
+    let covered_rows = state.hits.panes[0].inner_rect.y + 2;
+    state.config_diagnostic = Some(
+        (0..covered_rows)
+            .map(|_| "x".repeat(120))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    assert!(state.link_hover.is_some());
+    assert!(!state.compose(106, 20).unwrap().link_pointer);
+}
+
+#[test]
+fn ctrl_hover_pointer_follows_the_underline_while_the_endpoint_is_offline() {
+    let mut state = hover_state();
+    let mouse = hover_mouse(&state, 1, 0);
+    let id = hover_request(&state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]));
+    assert!(resolve_hover(&mut state, &id));
+    let pane = state.hits.panes[0].inner_rect;
+    state.set_endpoint_status(
+        &crate::client::endpoint::ClientEndpointId::Local,
+        ClientEndpointStatus::Reconnecting,
+    );
+    let frame = state.compose(106, 20).unwrap();
+    let underlined = frame.cells
+        [usize::from(pane.y) * usize::from(frame.width) + usize::from(pane.x + 1)]
+    .modifier
+        & Modifier::UNDERLINED.bits()
+        != 0;
+    assert_eq!(frame.link_pointer, underlined);
+}
+
+#[test]
+fn ctrl_hover_pointer_ignores_app_underlines_under_a_stale_hover() {
+    let mut state = hover_state();
+    let mut underlined = surface();
+    for cell in &mut underlined.frame.cells {
+        cell.modifier |= Modifier::UNDERLINED.bits();
+    }
+    state.set_pane_surface(underlined);
+    state.compose(106, 20).unwrap();
+    let mouse = hover_mouse(&state, 1, 0);
+    let id = hover_request(&state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]));
+    assert!(resolve_hover(&mut state, &id));
+    assert!(state.compose(106, 20).unwrap().link_pointer);
+    state.outer_focused = Some(false);
+    assert!(state.link_hover.is_some());
+    assert!(!state.compose(106, 20).unwrap().link_pointer);
 }
 
 #[test]

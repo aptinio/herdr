@@ -11,12 +11,18 @@ use base64::Engine as _;
 pub(crate) struct ComposedFrame {
     pub(crate) frame: FrameData,
     pub(crate) graphics: GraphicsOutput,
+    /// Whether the host pointer should show that a hovered link is clickable.
+    pub(crate) link_pointer: bool,
 }
 
 impl From<FrameData> for ComposedFrame {
     fn from(mut frame: FrameData) -> Self {
         let graphics = GraphicsOutput::from_bytes(std::mem::take(&mut frame.graphics));
-        Self { frame, graphics }
+        Self {
+            frame,
+            graphics,
+            link_pointer: false,
+        }
     }
 }
 
