@@ -750,6 +750,23 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
     foreground_group_changed || input.elapsed_since_process_check >= PROCESS_RECHECK_IDENTIFIED
 }
 
+// A job that is already in the observed foreground group when probing starts or
+// restarts, such as a command run into a just-created pane, may start its agent
+// later in the same group, so it gets the same window as a later group change.
+// The pane shell idle at its prompt does not.
+fn should_start_process_acquisition(
+    had_process_probe: bool,
+    process_group_changed: bool,
+    tracked_process_group_id: Option<u32>,
+    foreground_is_pane_shell: bool,
+) -> bool {
+    if had_process_probe {
+        process_group_changed
+    } else {
+        tracked_process_group_id.is_some() && !foreground_is_pane_shell
+    }
+}
+
 fn sync_content_change_acquisition(
     current_agent: Option<Agent>,
     suppressed_agent: Option<Agent>,
@@ -1088,8 +1105,12 @@ fn spawn_basic_detection_task(
                     acquisition_started_at = None;
                     last_content_change_at = None;
                 } else if agent_presence.current_agent().is_none()
-                    && had_process_probe
-                    && process_group_changed
+                    && should_start_process_acquisition(
+                        had_process_probe,
+                        process_group_changed,
+                        tracked_process_group_id,
+                        foreground_is_pane_shell,
+                    )
                 {
                     acquisition_started_at = Some(now);
                 }
@@ -3058,8 +3079,12 @@ impl PaneRuntime {
                                 acquisition_started_at = None;
                                 last_content_change_at = None;
                             } else if agent_presence.current_agent().is_none()
-                                && had_process_probe
-                                && process_group_changed
+                                && should_start_process_acquisition(
+                                    had_process_probe,
+                                    process_group_changed,
+                                    tracked_process_group_id,
+                                    foreground_is_pane_shell,
+                                )
                             {
                                 acquisition_started_at = Some(now);
                             }
@@ -6392,6 +6417,18 @@ mod tests {
             elapsed_since_process_check: PROCESS_ACQUISITION_SLOW_RECHECK,
             ..process_probe_input()
         }));
+    }
+
+    #[test]
+    fn first_probe_of_unidentified_job_starts_acquisition_window() {
+        let group = Some(42);
+        assert!(should_start_process_acquisition(false, true, group, false));
+        // A probe-state reset keeps the remembered group, so it may be unchanged.
+        assert!(should_start_process_acquisition(false, false, group, false));
+        assert!(!should_start_process_acquisition(false, true, group, true));
+        assert!(!should_start_process_acquisition(false, false, None, false));
+        assert!(should_start_process_acquisition(true, true, group, true));
+        assert!(!should_start_process_acquisition(true, false, group, false));
     }
 
     #[test]
