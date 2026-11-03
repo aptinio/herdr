@@ -666,6 +666,9 @@ struct ProcessProbeInput {
     pending_foreground_shell_clear: bool,
     pending_restore_probe: bool,
     elapsed_since_process_check: std::time::Duration,
+    // The last probe found a job other than the pane shell in the foreground,
+    // with no agent identified.
+    unidentified_foreground_job: bool,
 }
 
 fn foreground_group_changed(
@@ -740,9 +743,14 @@ fn should_probe_foreground_job(input: ProcessProbeInput) -> bool {
         }
     }
 
+    // A job can start its agent in the same foreground group after the
+    // acquisition window closes, so keep probing it at the slow acquisition
+    // rate. The pane shell idle at its prompt is not probed.
     if input.current_agent.is_none() {
         return !input.has_process_probe
             || foreground_group_changed
+            || (input.unidentified_foreground_job
+                && input.elapsed_since_process_check >= PROCESS_ACQUISITION_SLOW_RECHECK)
             || (input.foreground_pgid.is_none()
                 && input.elapsed_since_process_check >= PROCESS_RECHECK_MISSING_FOREGROUND_GROUP);
     }
@@ -972,6 +980,7 @@ fn spawn_basic_detection_task(
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
         let mut has_process_probe = false;
+        let mut unidentified_foreground_job = false;
         let mut acquisition_started_at = None;
         let mut last_content_change_at = None;
         let mut pending_foreground_shell_clear = false;
@@ -1007,6 +1016,7 @@ fn spawn_basic_detection_task(
                     last_process_check = std::time::Instant::now();
                     last_foreground_pgid = None;
                     has_process_probe = false;
+                    unidentified_foreground_job = false;
                     acquisition_started_at = None;
                     last_content_change_at = None;
                     pending_foreground_shell_clear = false;
@@ -1024,6 +1034,7 @@ fn spawn_basic_detection_task(
             let suppressed_agent = active_pending_release(&pending_release_for_task, now);
             if suppressed_agent.is_none() && release_was_active {
                 has_process_probe = false;
+                unidentified_foreground_job = false;
                 acquisition_started_at = None;
                 last_content_change_at = None;
             }
@@ -1059,6 +1070,7 @@ fn spawn_basic_detection_task(
                     pending_foreground_shell_clear,
                     pending_restore_probe: false,
                     elapsed_since_process_check: now.duration_since(last_process_check),
+                    unidentified_foreground_job,
                 };
                 should_check_foreground_process(
                     lifecycle_authority_active,
@@ -1101,6 +1113,9 @@ fn spawn_basic_detection_task(
                     pane_id,
                 );
                 last_foreground_pgid = tracked_process_group_id;
+                unidentified_foreground_job = agent_presence.current_agent().is_none()
+                    && tracked_process_group_id.is_some()
+                    && !foreground_is_pane_shell;
                 if new_agent.is_some() {
                     acquisition_started_at = None;
                     last_content_change_at = None;
@@ -2897,6 +2912,7 @@ impl PaneRuntime {
                 let mut last_observation = (Instant::now(), Some(0));
                 let mut last_foreground_pgid = None;
                 let mut has_process_probe = false;
+                let mut unidentified_foreground_job = false;
                 let mut acquisition_started_at = None;
                 let mut last_content_change_at = None;
                 let mut pending_foreground_shell_clear = false;
@@ -2942,6 +2958,7 @@ impl PaneRuntime {
                             last_visible_idle = false;
                             last_foreground_pgid = None;
                             has_process_probe = false;
+                            unidentified_foreground_job = false;
                             acquisition_started_at = None;
                             last_content_change_at = None;
                             pending_foreground_shell_clear = false;
@@ -2963,6 +2980,7 @@ impl PaneRuntime {
                     let suppressed_agent = active_pending_release(&pending_release_for_task, now);
                     if suppressed_agent.is_none() && release_was_active {
                         has_process_probe = false;
+                        unidentified_foreground_job = false;
                         acquisition_started_at = None;
                         last_content_change_at = None;
                     }
@@ -2991,6 +3009,7 @@ impl PaneRuntime {
                         pending_foreground_shell_clear,
                         pending_restore_probe,
                         elapsed_since_process_check: now.duration_since(last_process_check),
+                        unidentified_foreground_job,
                     };
                     #[cfg(windows)]
                     let content_seq = detection_content_seq.load(Ordering::Relaxed);
@@ -3075,6 +3094,9 @@ impl PaneRuntime {
                                 pane_id,
                             );
                             last_foreground_pgid = tracked_process_group_id;
+                            unidentified_foreground_job = agent_presence.current_agent().is_none()
+                                && tracked_process_group_id.is_some()
+                                && !foreground_is_pane_shell;
                             if new_agent.is_some() {
                                 acquisition_started_at = None;
                                 last_content_change_at = None;
@@ -6130,6 +6152,7 @@ mod tests {
             pending_foreground_shell_clear: false,
             pending_restore_probe: false,
             elapsed_since_process_check: std::time::Duration::from_secs(1),
+            unidentified_foreground_job: false,
         }
     }
 
@@ -6222,6 +6245,21 @@ mod tests {
         assert!(!should_probe_foreground_job(ProcessProbeInput {
             elapsed_since_process_check: PROCESS_RECHECK_MISSING_FOREGROUND_GROUP,
             ..process_probe_input()
+        }));
+    }
+
+    #[test]
+    fn unidentified_foreground_job_keeps_slow_acquisition_probe() {
+        let job = ProcessProbeInput {
+            unidentified_foreground_job: true,
+            elapsed_since_process_check: PROCESS_ACQUISITION_SLOW_RECHECK,
+            ..process_probe_input()
+        };
+        assert!(should_probe_foreground_job(job));
+        assert!(!should_probe_foreground_job(ProcessProbeInput {
+            elapsed_since_process_check: PROCESS_ACQUISITION_SLOW_RECHECK
+                - std::time::Duration::from_millis(1),
+            ..job
         }));
     }
 
