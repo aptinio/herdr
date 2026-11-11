@@ -281,6 +281,9 @@ fn restore_with_imports_and_failures(
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
+    if let Some(next) = snapshot.next_workspace_number {
+        crate::workspace::reserve_workspace_numbers_below(next);
+    }
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
             scrollback_limit_bytes,
@@ -425,7 +428,10 @@ fn restore_workspace(
             cached_git_ahead_behind: None,
             cached_git_space: None,
             worktree_space: snap.worktree_space.clone(),
-            metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
+            metadata_tokens: crate::metadata_tokens::MetadataTokens::persistent(
+                snap.metadata_tokens.clone(),
+            ),
+            // Sequences are not saved, so a reporter that restarts its count is not ignored.
             metadata_token_sequences: HashMap::new(),
             public_pane_numbers,
             next_public_pane_number,
@@ -1532,6 +1538,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                metadata_tokens: HashMap::new(),
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
@@ -1567,6 +1574,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            next_workspace_number: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1613,6 +1621,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                metadata_tokens: HashMap::new(),
                 public_pane_numbers: HashMap::from([(10, 1), (20, 3)]),
                 next_public_pane_number: 4,
                 public_tab_numbers: vec![5],
@@ -1662,6 +1671,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            next_workspace_number: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1686,6 +1696,77 @@ mod tests {
         assert_eq!(workspace.next_public_pane_number, 4);
         assert_eq!(workspace.tabs[0].number, 5);
         assert_eq!(workspace.next_public_tab_number, 6);
+    }
+
+    #[tokio::test]
+    async fn restore_carries_workspace_tokens_without_sequences_or_reused_ids() {
+        let cwd = std::env::current_dir().unwrap();
+        // Names a closed workspace numbered above the saved one.
+        let tokens = HashMap::from([("agent_grid_parent".to_string(), "w3".to_string())]);
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("w2".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                metadata_tokens: tokens.clone(),
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            agent_resume: None,
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+            next_workspace_number: Some(4),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+
+        let (workspaces, _terminals, _runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let workspace = workspaces.first().expect("workspace should restore");
+        assert_eq!(workspace.id, "w2");
+        assert_eq!(workspace.metadata_tokens.values(), tokens);
+        assert_eq!(workspace.metadata_tokens.next_expiry(), None);
+        // A reporter that restarts its sequence must not be rejected.
+        assert!(workspace.metadata_token_sequences.is_empty());
+        let generated = crate::workspace::generate_workspace_id();
+        assert!(crate::workspace::public_workspace_number(&generated) >= Some(4));
     }
 
     #[tokio::test]
@@ -1726,6 +1807,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                metadata_tokens: HashMap::new(),
                 public_pane_numbers: HashMap::from([(10, 1), (11, 2), (12, 3), (13, 4)]),
                 next_public_pane_number: 5,
                 public_tab_numbers: vec![1, 3, 4, 5],
@@ -1771,6 +1853,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            next_workspace_number: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -1809,6 +1892,7 @@ mod tests {
             custom_name: None,
             identity_cwd: cwd,
             worktree_space: None,
+            metadata_tokens: HashMap::new(),
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
@@ -1848,6 +1932,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd.clone(),
                 worktree_space: None,
+                metadata_tokens: HashMap::new(),
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
@@ -1883,6 +1968,7 @@ mod tests {
             sidebar_width: None,
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
+            next_workspace_number: None,
         };
         let (events, _event_rx) = mpsc::channel(4);
 
@@ -2204,6 +2290,7 @@ mod tests {
                 custom_name: None,
                 identity_cwd: cwd,
                 worktree_space: None,
+                metadata_tokens: HashMap::new(),
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
@@ -2223,6 +2310,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: Default::default(),
+            next_workspace_number: None,
         };
         history.layout_fingerprint = super::super::snapshot::layout_fingerprint(&snapshot);
         (snapshot, history)

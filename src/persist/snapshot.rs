@@ -26,6 +26,10 @@ pub struct SessionSnapshot {
     pub sidebar_section_split: Option<f32>,
     #[serde(default)]
     pub collapsed_space_keys: std::collections::HashSet<String>,
+    /// Set when closed workspaces used numbers above every saved one, so a restore
+    /// does not hand their IDs, which saved tokens may name, to new workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_workspace_number: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -57,6 +61,10 @@ pub struct WorkspaceSnapshot {
     pub identity_cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
+    /// Workspace metadata tokens reported without a TTL. Omitted when empty, so
+    /// snapshots without tokens keep their earlier form.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata_tokens: HashMap<String, String>,
     #[serde(default)]
     pub public_pane_numbers: HashMap<u32, usize>,
     #[serde(default)]
@@ -169,6 +177,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             custom_name: snap.custom_name,
             identity_cwd,
             worktree_space: None,
+            metadata_tokens: HashMap::new(),
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
@@ -195,6 +204,8 @@ struct RawSessionSnapshot {
     sidebar_section_split: Option<f32>,
     #[serde(default)]
     collapsed_space_keys: std::collections::HashSet<String>,
+    #[serde(default)]
+    next_workspace_number: Option<u64>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -210,6 +221,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
         collapsed_space_keys: raw.collapsed_space_keys,
+        next_workspace_number: raw.next_workspace_number,
     })
 }
 
@@ -281,7 +293,18 @@ pub fn capture(
         sidebar_width: None,
         sidebar_section_split: None,
         collapsed_space_keys: std::collections::HashSet::new(),
+        next_workspace_number: reserved_workspace_number(workspaces),
     }
+}
+
+fn reserved_workspace_number(workspaces: &[Workspace]) -> Option<u64> {
+    let next = crate::workspace::next_workspace_number();
+    let after_saved = workspaces
+        .iter()
+        .filter_map(|workspace| crate::workspace::public_workspace_number(&workspace.id))
+        .max()
+        .map_or(1, |max| (max as u64).saturating_add(1));
+    (next > after_saved).then_some(next)
 }
 
 fn capture_workspace(
@@ -307,6 +330,7 @@ fn capture_workspace(
         custom_name: ws.custom_name.clone(),
         identity_cwd,
         worktree_space: ws.worktree_space.clone(),
+        metadata_tokens: ws.metadata_tokens.persistent_values(),
         public_pane_numbers: ws
             .public_pane_numbers
             .iter()
@@ -409,6 +433,17 @@ pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
     value["collapsed_space_keys"] = serde_json::to_value(collapsed).ok()?;
+    // Tokens and the reserved workspace number are not layout, and a build without
+    // those fields drops them on load, so hashing them would discard pane history
+    // after a downgrade.
+    if let Some(object) = value.as_object_mut() {
+        object.remove("next_workspace_number");
+    }
+    if let Some(workspaces) = value["workspaces"].as_array_mut() {
+        for workspace in workspaces.iter_mut().filter_map(|w| w.as_object_mut()) {
+            workspace.remove("metadata_tokens");
+        }
+    }
     let bytes = serde_json::to_vec(&value).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -524,7 +559,9 @@ mod tests {
     use super::*;
     use crate::app::{AppState, Mode};
     use crate::layout::NavDirection;
-    use crate::workspace::Workspace;
+    use crate::workspace::{
+        encode_public_number, next_workspace_number, public_workspace_number, Workspace,
+    };
 
     fn session_fixture(name: &str) -> &'static str {
         match name {
@@ -654,6 +691,23 @@ mod tests {
     }
 
     #[test]
+    fn layout_fingerprint_ignores_fields_older_builds_drop() {
+        let mut snapshot = parse_snapshot(include_str!(
+            "../../tests/fixtures/session/current-herdr-session.json"
+        ))
+        .unwrap();
+        let expected = layout_fingerprint(&snapshot).unwrap();
+        snapshot.workspaces[0]
+            .metadata_tokens
+            .insert("agent_grid_parent".into(), "w2".into());
+        snapshot.next_workspace_number = Some(40);
+        assert_eq!(
+            layout_fingerprint(&snapshot).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
     fn round_trip_empty_session() {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
@@ -663,6 +717,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            next_workspace_number: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -728,6 +783,7 @@ mod tests {
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
+                metadata_tokens: HashMap::new(),
                 public_pane_numbers: HashMap::from([(0, 1), (1, 2)]),
                 next_public_pane_number: 3,
                 public_tab_numbers: vec![1],
@@ -752,6 +808,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            next_workspace_number: None,
             version: SNAPSHOT_VERSION,
         };
 
@@ -953,6 +1010,62 @@ mod tests {
             snapshot.workspaces[0].worktree_space,
             state.workspaces[0].worktree_space
         );
+    }
+
+    #[test]
+    fn capture_contract_tracks_workspace_tokens_without_ttl() {
+        let now = std::time::Instant::now();
+        let mut state = state_with_workspaces(&["parent", "child"]);
+        state.workspaces[1].metadata_tokens.patch(
+            HashMap::from([("agent_grid_parent".into(), Some("w1".into()))]),
+            None,
+            now,
+        );
+        state.workspaces[1].metadata_tokens.patch(
+            HashMap::from([("summary".into(), Some("temporary".into()))]),
+            Some(std::time::Duration::from_secs(60)),
+            now,
+        );
+
+        let snapshot = capture_from_state(&state);
+
+        assert!(snapshot.workspaces[0].metadata_tokens.is_empty());
+        assert_eq!(
+            snapshot.workspaces[1].metadata_tokens,
+            HashMap::from([("agent_grid_parent".into(), "w1".into())])
+        );
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json["workspaces"][0].get("metadata_tokens").is_none());
+        let restored = parse_snapshot(&json.to_string()).unwrap();
+        assert_eq!(
+            restored.workspaces[1].metadata_tokens,
+            snapshot.workspaces[1].metadata_tokens
+        );
+    }
+
+    #[test]
+    fn capture_saves_next_workspace_number_only_past_closed_workspaces() {
+        let mut state = state_with_workspaces(&["kept", "closed"]);
+        let closed = state.workspaces.pop().unwrap();
+        let closed_number = public_workspace_number(&closed.id).unwrap() as u64;
+
+        let snapshot = capture_from_state(&state);
+
+        assert!(snapshot
+            .next_workspace_number
+            .is_some_and(|next| next > closed_number));
+        let restored = parse_snapshot(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(
+            restored.next_workspace_number,
+            snapshot.next_workspace_number
+        );
+
+        let newest = next_workspace_number() as usize + 1000;
+        state.workspaces[0].id = format!("w{}", encode_public_number(newest));
+        let snapshot = capture_from_state(&state);
+        assert_eq!(snapshot.next_workspace_number, None);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("next_workspace_number").is_none());
     }
 
     #[test]
@@ -1429,6 +1542,7 @@ mod tests {
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
+                metadata_tokens: HashMap::new(),
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),
@@ -1453,6 +1567,7 @@ mod tests {
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
             collapsed_space_keys: std::collections::HashSet::new(),
+            next_workspace_number: None,
         };
 
         let json = serde_json::to_string(&snap).unwrap();

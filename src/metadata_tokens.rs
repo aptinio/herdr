@@ -41,6 +41,21 @@ pub(crate) fn accept_sequence(
 }
 
 impl MetadataTokens {
+    /// Rebuilds tokens saved by `persistent_values`, which carry no expiry.
+    pub(crate) fn persistent(values: HashMap<String, String>) -> Self {
+        let entries = values
+            .into_iter()
+            .map(|(key, value)| {
+                let token = MetadataToken {
+                    value,
+                    expires_at: None,
+                };
+                (key, token)
+            })
+            .collect();
+        Self { entries }
+    }
+
     pub(crate) fn patch(
         &mut self,
         patch: HashMap<String, Option<String>>,
@@ -84,6 +99,15 @@ impl MetadataTokens {
     pub(crate) fn values(&self) -> HashMap<String, String> {
         self.entries
             .iter()
+            .map(|(key, token)| (key.clone(), token.value.clone()))
+            .collect()
+    }
+
+    /// Tokens without a TTL, the ones a workspace snapshot saves.
+    pub(crate) fn persistent_values(&self) -> HashMap<String, String> {
+        self.entries
+            .iter()
+            .filter(|(_, token)| token.expires_at.is_none())
             .map(|(key, token)| (key.clone(), token.value.clone()))
             .collect()
     }
@@ -236,6 +260,27 @@ mod tests {
             tokens.values(),
             HashMap::from([("summary".into(), "new".into())])
         );
+    }
+
+    #[test]
+    fn persistent_values_skip_ttl_tokens_and_restore_without_expiry() {
+        let now = Instant::now();
+        let mut tokens = MetadataTokens::default();
+        tokens.patch(
+            patch(&[("summary", Some("temporary"))]),
+            Some(Duration::from_secs(1)),
+            now,
+        );
+        tokens.patch(patch(&[("agent_grid_parent", Some("w1"))]), None, now);
+
+        let persistent = tokens.persistent_values();
+        assert_eq!(
+            persistent,
+            HashMap::from([("agent_grid_parent".into(), "w1".into())])
+        );
+        let restored = MetadataTokens::persistent(persistent.clone());
+        assert_eq!(restored.values(), persistent);
+        assert_eq!(restored.next_expiry(), None);
     }
 
     #[test]

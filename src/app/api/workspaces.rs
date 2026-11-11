@@ -298,10 +298,15 @@ impl App {
                 );
             }
         }
+        let persistent_before = workspace.metadata_tokens.persistent_values();
         let changed = workspace
             .metadata_tokens
             .patch(tokens, ttl, std::time::Instant::now());
         if changed {
+            // Only tokens without a TTL are saved with the session.
+            if workspace.metadata_tokens.persistent_values() != persistent_before {
+                self.state.mark_session_dirty();
+            }
             self.sync_agent_metadata_deadline();
             self.emit_workspace_token_updated(index);
         }
@@ -975,6 +980,50 @@ mod tests {
                 if workspace.tokens.get("summary").map(String::as_str) == Some("done")
                     && !workspace.tokens.contains_key("jj_status")
         )));
+    }
+
+    #[test]
+    fn workspace_tokens_without_ttl_mark_the_session_for_saving() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        let workspace_id = app.public_workspace_id(0);
+
+        for (key, value, ttl_ms, saves) in [
+            ("summary", Some("temporary"), Some(60_000), false),
+            ("summary", None, None, false),
+            ("parent", Some("w1"), None, true),
+            ("parent", Some("w1"), None, false),
+            ("parent", Some("w1"), Some(60_000), true),
+            ("parent", Some("w2"), None, true),
+            ("parent", None, None, true),
+        ] {
+            app.state.session_dirty = false;
+            let response = app.handle_workspace_report_metadata(
+                "req".into(),
+                WorkspaceReportMetadataParams {
+                    workspace_id: workspace_id.clone(),
+                    source: "user:test".into(),
+                    tokens: std::collections::HashMap::from([(
+                        key.into(),
+                        value.map(str::to_string),
+                    )]),
+                    seq: None,
+                    ttl_ms,
+                },
+            );
+            let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                app.state.session_dirty, saves,
+                "{key}={value:?} with ttl {ttl_ms:?}"
+            );
+        }
     }
 
     #[test]

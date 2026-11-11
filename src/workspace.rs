@@ -148,6 +148,11 @@ pub(crate) fn public_tab_id_for_number(workspace_id: &str, tab_number: usize) ->
     format!("{workspace_id}:t{}", encode_public_number(tab_number))
 }
 
+/// The number the next generated workspace ID will use.
+pub(crate) fn next_workspace_number() -> u64 {
+    NEXT_WORKSPACE_ID.load(Ordering::Relaxed)
+}
+
 pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     let Some(next) = workspaces
         .iter()
@@ -157,7 +162,11 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
     else {
         return;
     };
+    reserve_workspace_numbers_below(next);
+}
 
+/// Keep generated workspace IDs at or above `next`.
+pub(crate) fn reserve_workspace_numbers_below(next: u64) {
     let mut current = NEXT_WORKSPACE_ID.load(Ordering::Relaxed);
     while current < next {
         match NEXT_WORKSPACE_ID.compare_exchange_weak(
