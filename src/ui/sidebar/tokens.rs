@@ -179,7 +179,10 @@ pub(crate) fn space_rows(
 
 pub(crate) fn separator(previous: &ResolvedToken, current: &ResolvedToken) -> &'static str {
     if matches!(previous.kind, ResolvedTokenKind::StateIcon)
-        || matches!(current.kind, ResolvedTokenKind::GitStatus { .. })
+        || matches!(
+            current.kind,
+            ResolvedTokenKind::StateIcon | ResolvedTokenKind::GitStatus { .. }
+        )
     {
         " "
     } else {
@@ -557,6 +560,17 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
                 ResolvedToken::unstyled(ResolvedTokenKind::Workspace("feature".into())),
             ]]
         );
+    }
+
+    #[test]
+    fn state_icon_takes_a_space_on_both_sides() {
+        let indent = ResolvedToken::unstyled(ResolvedTokenKind::Custom("\u{2800}".into()));
+        let icon = ResolvedToken::unstyled(ResolvedTokenKind::StateIcon);
+        let label = ResolvedToken::unstyled(ResolvedTokenKind::Workspace("repo".into()));
+
+        assert_eq!(separator(&indent, &icon), " ");
+        assert_eq!(separator(&icon, &label), " ");
+        assert_eq!(separator(&indent, &label), " · ");
     }
 
     #[test]
